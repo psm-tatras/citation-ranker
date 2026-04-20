@@ -9,7 +9,7 @@ import os
 
 
 if __name__ == "__main__":
-    DATA_DIR = "/media/parthosarothi/Studio/UbuntuWorkSpace/SemanticScholarDataset/mini"
+    DATA_DIR = "/media/parthosarothi/Studio/UbuntuWorkSpace/SemanticScholarDataset/main"
     for root,_,files in os.walk(DATA_DIR):
         for fname in files:
             file_path = os.path.join(root,fname)

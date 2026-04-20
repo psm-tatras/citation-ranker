@@ -3,6 +3,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 from dotenv import load_dotenv
 import os
+import sys
 status = load_dotenv()
 print("ENV loaded ",status)
 
@@ -73,10 +74,10 @@ def search_by_corpus_id(collection: Collection, corpus_id: str) -> dict | None:
     record = collection.find_one({"corpus_id": corpus_id})
     
     if record:
-        print(f"Found record for corpus_id: {corpus_id}")
+        # print(f"Found record for corpus_id: {corpus_id}")
         return record
     else:
-        print(f"No record found for corpus_id: {corpus_id}")
+        # print(f"No record found for corpus_id: {corpus_id}")
         return None
 
 def get_collection_stats(collection: Collection):
@@ -86,24 +87,58 @@ def get_collection_stats(collection: Collection):
     print(f"Index size   : {stats['totalIndexSize']} MB")
     print(f"Doc count    : {stats['count']}")
 
-# ── Usage ──────────────────────────────────────────────────────────────────────
+
+def find_existing_citations(collection: Collection,corpus_id:int):
+    found_citations = []
+    total_citation = 0
+    paper = search_by_corpus_id(collection,corpus_id)
+    if paper:
+        citations_in_paper = paper["citation"]
+        
+        for citation_id in citations_in_paper.keys():
+            matched_paper_id = citations_in_paper[citation_id]["matched_paper_id"]
+            total_citation += 1
+            if matched_paper_id is not None:
+                cited_paper = search_by_corpus_id(collection,int(matched_paper_id))
+                if cited_paper:
+                    found_citations.append(matched_paper_id)
+    return found_citations,total_citation
+
+def scan_corpus_ids_stream(collection: Collection):
+    """Memory efficient - processes one at a time."""
+    cursor = collection.find({}, {"corpus_id": 1, "_id": 0}).batch_size(500)
+    f = open("/media/parthosarothi/Studio/UbuntuWorkSpace/SemanticScholarDataset/all_matched_citations.csv","w")
+    count = 0
+    for doc in cursor:
+        try:
+            corpus_id = doc["corpus_id"]
+            found_citations,total_citation = find_existing_citations(collection,corpus_id=corpus_id)
+            if len(found_citations) > 0:
+                # print("found match in ",corpus_id)
+                success = len(found_citations) / total_citation
+                f.write(f"{corpus_id},{len(found_citations)},{total_citation},{success}\n")
+            count += 1
+            # print(f"Total scanned: {count}")
+            sys.stdout.write(f"\rTotal processed {count}")
+            sys.stdout.flush()
+        except Exception as e:
+            print(e)
+        # if count >=1000:
+        #     break
+    f.close()
+
 
 if __name__ == "__main__":
     collection = get_collection()
     get_collection_stats(collection)
-    # Insert a single record
-    # insert_record(collection, "27603005", {
-    #     "title": "Some Paper Title",
-    #     "abstract": "Some abstract text...",
-    #     "citation": [{"ref_id": "b0", "paper_id": "123456"}]
-    # })
-
-    # # Insert multiple records from a dict
-    # records = {
-    #     "27603005": {"title": "Title A", "abstract": "Abstract A", "citation": []},
-    #     "72705592": {"title": "Title B", "abstract": "Abstract B", "citation": []},
-    # }
-    # insert_many_records(collection, records)
-
+    
     # Insert from a JSONL file (memory efficient for large files)
-    # insert_from_jsonl(collection, "/home/parthosarothi/IISER-Work/citation-ranker/citation-ranker/20260313_115134_00043_vcx4r_0a24153e-8434-4220-9c25-922408f36db8.gz_citations.jsonl")
+    # data_dir = "/media/parthosarothi/Studio/UbuntuWorkSpace/SemanticScholarDataset/extracted"
+    # for root,_,fnames in os.walk(data_dir):
+    #     for fname in fnames:
+    #         path = os.path.join(root,fname)
+    #         if fname.split(".")[-1] == "jsonl":
+    #             print("Insert from ",fname)
+    #             insert_from_jsonl(collection, path)
+            # break
+    scan_corpus_ids_stream(collection)
