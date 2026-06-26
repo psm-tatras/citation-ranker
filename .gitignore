@@ -1,0 +1,8 @@
+*.jsonl
+*.json
+*.gz
+*.pyc
+__pycache__/
+.env
+*.csv
+*.txt
