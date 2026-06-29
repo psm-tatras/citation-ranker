@@ -133,6 +133,9 @@ def extract_from_jsonl(raw_content:dict,corpus_id:str):
                     else:
                         record = {}
                         success = False
+                        reason = "No Citation"
+                else:
+                    reason = "Citation format"
                     print(f"finished clean extraction from {corpus_id}, #valid citations {nb_citations}, #total citations {raw_citations}")
     except Exception as e:
         print(f"Can not extract this info",tr.format_exc())
