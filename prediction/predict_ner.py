@@ -458,7 +458,7 @@ def predict_ner_slm(abstract, tokenizer, model, max_new_tokens=512):
 # definitions and rules, with no few-shot examples.
 
 
-def load_ft_ner_model(local_dir, s3_bucket=None, wandb_project=None, artifact_name=None,
+def load_ft_ner_model(local_dir, wandb_project=None, artifact_name=None,
                       base_model_id="Qwen/Qwen2.5-7B-Instruct",
                       load_in_4bit=True, dtype="bfloat16", device_map="auto"):
     """Load the QLoRA fine-tuned NER model: resolves the latest trained
@@ -473,10 +473,11 @@ def load_ft_ner_model(local_dir, s3_bucket=None, wandb_project=None, artifact_na
     chat template you trained with is used.
 
     local_dir   : where the adapter is downloaded to / then loaded from.
-    s3_bucket   : overrides the bucket recorded in the artifact's metadata.
     wandb_project, artifact_name : W&B project / model artifact name to
                   resolve "latest" from; default to train_qlora.py's
-                  WANDB_PROJECT / WANDB_ADAPTER_ARTIFACT_NAME.
+                  WANDB_PROJECT / WANDB_ADAPTER_ARTIFACT_NAME. The S3
+                  bucket/prefix always come from that artifact's own
+                  metadata, not a parameter here.
     """
     import torch
     from transformers import (AutoModelForCausalLM, AutoTokenizer,
@@ -486,7 +487,6 @@ def load_ft_ner_model(local_dir, s3_bucket=None, wandb_project=None, artifact_na
 
     adapter_dir = load_latest_adapter(
         Path(local_dir),
-        s3_bucket=s3_bucket,
         wandb_project=wandb_project or WANDB_PROJECT,
         artifact_name=artifact_name or WANDB_ADAPTER_ARTIFACT_NAME,
     )

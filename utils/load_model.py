@@ -90,16 +90,17 @@ def resolve_latest_adapter_artifact(wandb_project: str = WANDB_PROJECT,
 
 
 def load_latest_adapter(local_dir: Path,
-                         s3_bucket: str = None,
                          wandb_project: str = WANDB_PROJECT,
                          artifact_name: str = WANDB_ADAPTER_ARTIFACT_NAME,
                          wandb_run=None) -> Path:
     """
     Resolve the latest trained adapter via its W&B artifact and download it.
+    The S3 bucket and key prefix both come from the artifact's own metadata
+    (written by train_qlora.py when it registers the artifact) -- the
+    artifact is the single source of truth for where its weights live.
 
     Args:
         local_dir: directory to download the adapter into
-        s3_bucket: overrides the bucket recorded in the artifact's metadata
         wandb_project, artifact_name, wandb_run: see resolve_latest_adapter_artifact
 
     Returns:
@@ -115,7 +116,7 @@ def load_latest_adapter(local_dir: Path,
             f"W&B project '{wandb_project}': {e}"
         )
 
-    bucket = s3_bucket or artifact.metadata.get("s3_bucket")
+    bucket = artifact.metadata.get("s3_bucket")
     key_prefix = artifact.metadata.get("s3_key_prefix")
     if not bucket or not key_prefix:
         raise ValueError(

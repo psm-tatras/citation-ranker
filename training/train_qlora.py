@@ -306,7 +306,6 @@ def train_qlora(
         resumed_adapter_dir = output_dir / "resumed_adapter"
         adapter_path = load_latest_adapter(
             resumed_adapter_dir,
-            s3_bucket=s3_bucket,
             wandb_project=wandb_project,
             artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
             wandb_run=run,
