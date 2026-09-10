@@ -18,7 +18,7 @@ Functions
 import os
 import re
 from pathlib import Path
-
+from utils.prompts import *
 import torch
 from transformers import (
     AutoTokenizer,
@@ -484,6 +484,7 @@ def load_ft_ner_model(local_dir, wandb_project=None, artifact_name=None,
                               BitsAndBytesConfig)
     from peft import PeftModel
     from utils.load_model import load_latest_adapter, WANDB_PROJECT, WANDB_ADAPTER_ARTIFACT_NAME
+
 
     adapter_dir = load_latest_adapter(
         Path(local_dir),
