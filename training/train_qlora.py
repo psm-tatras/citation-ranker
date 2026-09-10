@@ -172,6 +172,7 @@ def train_qlora(
     train_artifact_file: str = WANDB_ARTIFACT_TRAIN_FILE,
     val_artifact_file: str = WANDB_ARTIFACT_VAL_FILE,
     mode: str = TRAINING_MODE,
+    run_name: str = None,
 ):
     """
     Fine-tune Qwen2.5-7B with QLoRA on research abstract NER.
@@ -205,6 +206,7 @@ def train_qlora(
         val_artifact_file: name of the validation-data file inside the artifact
         mode: 'new' starts LoRA training from scratch; 'resume' finds the most
             recent run under s3_bucket/s3_key_prefix and continues training it
+        run_name: W&B run name; if None, W&B auto-generates one (e.g. 'young-microwave-2')
     """
     # trl is only needed for actual training (not for resolving/downloading
     # the adapter via utils.load_model), so it's kept out of module-level
@@ -219,6 +221,7 @@ def train_qlora(
     print("\n[0/6] Initializing W&B...")
     run = wandb.init(
         project=wandb_project,
+        name=run_name or None,  # empty string (e.g. blank CLI/launch-config input) -> auto-generate
         job_type="train",
         config={
             "model": model_name,
@@ -463,10 +466,12 @@ if __name__ == "__main__":
     parser.add_argument("--train-file", type=Path, default=Path("training_data_train.jsonl"), help="Local training file")
     parser.add_argument("--val-file", type=Path, default=Path("training_data_val.jsonl"), help="Local validation file")
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/qwen_ner"), help="Checkpoint directory")
+    parser.add_argument("--wandb-project", default=WANDB_PROJECT, help="W&B project this run logs to (the training run + adapter artifact)")
     parser.add_argument("--dataset-artifact", default=WANDB_DATASET_ARTIFACT, help="W&B dataset artifact reference (e.g. 'dataset-ner-3k:latest')")
     parser.add_argument("--dataset-wandb-project", default=WANDB_DATASET_PROJECT, help="W&B project the dataset artifact lives in, if different from --wandb-project (default: same project)")
     parser.add_argument("--train-artifact-file", default=WANDB_ARTIFACT_TRAIN_FILE, help="Training file name inside the W&B artifact")
     parser.add_argument("--val-artifact-file", default=WANDB_ARTIFACT_VAL_FILE, help="Validation file name inside the W&B artifact")
+    parser.add_argument("--run-name", default=None, help="W&B run name (default: auto-generated)")
     parser.add_argument("--mode", choices=["new", "resume"], default=TRAINING_MODE,
                          help="'new' trains from scratch; 'resume' loads adapter weights from S3 first")
     parser.add_argument("--epochs", type=int, default=3)
@@ -498,9 +503,11 @@ if __name__ == "__main__":
         lora_alpha=args.lora_alpha,
         max_seq_length=args.max_seq_length,
         save_steps=args.save_steps,
+        wandb_project=args.wandb_project,
         dataset_artifact=args.dataset_artifact,
         dataset_wandb_project=args.dataset_wandb_project,
         train_artifact_file=args.train_artifact_file,
         val_artifact_file=args.val_artifact_file,
         mode=args.mode,
+        run_name=args.run_name,
     )
