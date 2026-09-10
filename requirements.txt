@@ -1,0 +1,11 @@
+# Install a CUDA-compatible PyTorch build separately when needed.
+torch
+transformers
+datasets
+peft
+trl
+bitsandbytes
+accelerate
+boto3
+wandb
+python-dotenv

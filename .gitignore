@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.venv/
+venv/
+env/
+
+.env
+.env.*
+!.env.example
+
+# Training outputs and downloaded model artifacts
+checkpoints/
+outputs/
+models/
+*.safetensors
+
+# Local datasets and experiment logs
+*.jsonl
+wandb/
+runs/
+.tensorboard/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
