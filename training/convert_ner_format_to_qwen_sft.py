@@ -40,7 +40,7 @@ import json
 import os
 import random
 
-from utils.prompts import NER_SYSTEM, NER_TRAIN_USER_TMPL
+from utils.prompts import NER_SYSTEM, NER_USER_TMPL
 
 
 def find_stem_files(input_dir):
@@ -89,7 +89,7 @@ def build_example(rec, labels_csv):
     ents = sorted(rec.get("entities", []), key=lambda e: e.get("start", 0))
     # target: text + label only, in order, exactly as the parser expects
     target = {"entities": [{"text": e["text"], "label": e["label"]} for e in ents]}
-    user = NER_TRAIN_USER_TMPL.format(labels_csv=labels_csv, abstract=text)
+    user = NER_USER_TMPL.format(labels_csv=labels_csv, abstract=text)
     return {
         "messages": [
             {"role": "system", "content": NER_SYSTEM},

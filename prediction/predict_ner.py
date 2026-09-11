@@ -498,16 +498,15 @@ def load_ft_ner_model(local_dir, wandb_project=None, artifact_name=None,
 
 def predict_ner_ft(abstract, tokenizer, model, max_new_tokens=512):
     """Runs the QLoRA fine-tuned NER model on an abstract; same return contract
-    as predict_ner (list of {text, label, start, end}). Uses the LEAN training
-    prompt (imported from convert_ner_format_to_qwen_sft), not the few-shot
-    prompt, because that is what the QLoRA model was trained on. JSON parsing
-    + offset resolution reuse slm_generate's robust helpers (array-close
-    repair, LaTeX sanitizing)."""
-    
+    as predict_ner (list of {text, label, start, end}). Uses NER_USER_TMPL
+    (the same prompt used to build the training data), so inference matches
+    what the QLoRA model was trained on. JSON parsing + offset resolution
+    reuse slm_generate's robust helpers (array-close repair, LaTeX
+    sanitizing)."""
 
     messages = [
         {"role": "system", "content": NER_SYSTEM},
-        {"role": "user", "content": build_ner_training_prompt(abstract, LABELS)},
+        {"role": "user", "content": build_ner_user_prompt(abstract, LABELS)},
     ]
     prompt = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True)  # True: generate answer

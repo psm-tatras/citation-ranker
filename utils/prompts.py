@@ -56,24 +56,6 @@ ABSTRACT:
 {abstract}
 """
 
-NER_TRAIN_USER_TMPL = """Identify spans in the ABSTRACT that play a research role and label each with exactly one of these labels. Use the rarer labels whenever they apply -- do not collapse everything into the common ones.
-
-LABELS: {labels_csv}
-
-RULES:
-- Copy each surface string EXACTLY as it appears in the abstract (no paraphrase, no re-casing).
-- A newly proposed thing is CONTRIBUTION even if it is also a method/dataset.
-- A comparative result is IMPROVEMENT, not FINDING.
-- A named measured quantity is METRIC, not KEY_CONCEPT.
-- List entities in order of appearance. Do not include offsets.
-
-Return ONLY this JSON, no prose, no code fences:
-{{"entities": [{{"text": "<exact surface>", "label": "<ONE LABEL>"}}]}}
-
-ABSTRACT:
-{abstract}
-"""
-
 HL_SYSTEM = (
     "You write concise research highlights (the key contributions) of a paper "
     "given its abstract. You output only the highlights, no preamble."
@@ -790,9 +772,3 @@ def build_ner_user_prompt(abstract, labels=LABELS):
     )
 
 
-def build_ner_training_prompt(abstract, labels):
-    """Format the lean training/inference prompt for one abstract."""
-    return NER_TRAIN_USER_TMPL.format(
-        labels_csv=", ".join(labels),
-        abstract=abstract,
-    )
