@@ -25,8 +25,8 @@ from transformers import (
     AutoModelForTokenClassification,
     AutoModelForSeq2SeqLM,
 )
-from .slm_generate import chat, extract_json, resolve_offsets
-from utils.prompts import NER_SYSTEM, build_ner_user_prompt
+from .slm_generate import extract_json, resolve_offsets
+from utils.prompts import NER_SYSTEM
 
 
 def load_ner_model(model_dir=None, device=None):
@@ -222,7 +222,7 @@ def augment_context(entity, abstract, window=1, max_chars=0,
     Parameters
     ----------
     entity   : dict with at least 'start' and 'end' (char offsets into
-               `abstract`); the shape predict_ner / predict_ner_slm return.
+               `abstract`); the shape predict_ner / predict_ner_ft return.
     abstract : the full source text the offsets index into.
     window   : sentences to include on EACH side of the entity's sentence.
                window=0 -> just the entity's own sentence;
@@ -420,36 +420,16 @@ def augment_context_by_label(entities, abstract, window=1,
         per = {}
         for e in b["entities"]:
             per.setdefault(e["label"], []).append(e)
+        highlighted_text = b["text"]
         for label, ents in per.items():
-            entry = {"text": b["text"], "entities": ents}
+            for a_ent in ents:
+                ner_text = a_ent["text"]
+                highlighted_text = highlighted_text.replace(ner_text,f" <{ner_text}> ")
+            entry = {"text": highlighted_text, "entities": ents}
             if "embed_text" in b:
                 entry["embed_text"] = b["embed_text"]
             by_label.setdefault(label, []).append(entry)
     return by_label
-
-
-def load_slm_ner_model(model_id="Qwen/Qwen2.5-7B-Instruct", load_in_4bit=True,
-                       dtype="bfloat16"):
-    """Loads the local SLM used for prompted NER (see slm_generate.py)."""
-    from .slm_generate import load_model
-    return load_model(model_id, load_in_4bit=load_in_4bit, dtype=dtype)
-
-
-def predict_ner_slm(abstract, tokenizer, model, max_new_tokens=512):
-    """SLM-prompted counterpart to predict_ner: same return contract (list of
-    {text, label, start, end}), but tagged by prompting Qwen with the exact
-    system/user templates and JSON parsing/offset-resolution from
-    slm_generate.py, instead of running the fine-tuned token classifier."""
-    
-
-    raw = chat(tokenizer, model, NER_SYSTEM,
-               build_ner_user_prompt(abstract),
-               max_new_tokens=max_new_tokens)
-    try:
-        entities = extract_json(raw).get("entities", [])
-    except Exception:
-        return []
-    return resolve_offsets(abstract, entities)
 
 
 # --- Fine-tuned (QLoRA adapter) NER -----------------------------------------
@@ -517,13 +497,12 @@ def load_ft_ner_model(local_dir, wandb_project=None, artifact_name=None,
 
 
 def predict_ner_ft(abstract, tokenizer, model, max_new_tokens=512):
-    """Fine-tuned counterpart to predict_ner_slm: same return contract (list of
-    {text, label, start, end}). Uses the LEAN training prompt (imported from
-    convert_ner_format_to_qwen_sft), not the few-shot prompt, because that is
-    what the QLoRA model was trained on. JSON parsing + offset resolution
-    reuse slm_generate's robust helpers (array-close repair, LaTeX
-    sanitizing), so fine-tuned output scores through the SAME pipeline as the
-    prompted SLM and SciBERT paths."""
+    """Runs the QLoRA fine-tuned NER model on an abstract; same return contract
+    as predict_ner (list of {text, label, start, end}). Uses the LEAN training
+    prompt (imported from convert_ner_format_to_qwen_sft), not the few-shot
+    prompt, because that is what the QLoRA model was trained on. JSON parsing
+    + offset resolution reuse slm_generate's robust helpers (array-close
+    repair, LaTeX sanitizing)."""
     
 
     messages = [
