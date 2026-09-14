@@ -196,10 +196,10 @@ async def get_papers_from_s3(
 
     Returns:
         dict mapping paper_id -> parsed JSON dict, or None for any paper_id
-        not found in S3 / failed to fetch
+        not found in S3 (NoSuchKey/404). Connection/auth/other errors are NOT
+        swallowed -- they raise out of this call so a broken S3 connection
+        surfaces immediately instead of silently coming back as all-None.
     """
-    logger = logging.getLogger(__name__)
-
     s3_config = Config(max_pool_connections=num_workers, retries={'max_attempts': 3})
     s3_client = boto3.client(
         's3',
@@ -213,17 +213,17 @@ async def get_papers_from_s3(
 
     async def fetch_one(paper_id):
         async with semaphore:
-            try:
-                return paper_id, await asyncio.to_thread(
-                    get_paper_from_s3,
-                    paper_id,
-                    bucket_name=bucket_name,
-                    directory=directory,
-                    s3_client=s3_client,
-                )
-            except Exception as e:
-                logger.error(f"Failed to fetch {paper_id}: {str(e)}")
-                return paper_id, None
+            # get_paper_from_s3 already returns None for a genuine "not
+            # found" (NoSuchKey/404); anything else (bad credentials, no
+            # connection, access denied, ...) raises and is left to
+            # propagate below, rather than being masked as "not found".
+            return paper_id, await asyncio.to_thread(
+                get_paper_from_s3,
+                paper_id,
+                bucket_name=bucket_name,
+                directory=directory,
+                s3_client=s3_client,
+            )
 
     tasks = [asyncio.ensure_future(fetch_one(pid)) for pid in paper_ids]
     results = {}

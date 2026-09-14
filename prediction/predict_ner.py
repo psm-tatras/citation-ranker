@@ -420,16 +420,31 @@ def augment_context_by_label(entities, abstract, window=1,
         per = {}
         for e in b["entities"]:
             per.setdefault(e["label"], []).append(e)
-        highlighted_text = b["text"]
         for label, ents in per.items():
-            for a_ent in ents:
-                ner_text = a_ent["text"]
-                highlighted_text = highlighted_text.replace(ner_text,f" <{ner_text}> ")
-            entry = {"text": highlighted_text, "entities": ents}
+            entry = {"text": _highlight_entities(b["text"], ents), "entities": ents}
             if "embed_text" in b:
                 entry["embed_text"] = b["embed_text"]
             by_label.setdefault(label, []).append(entry)
     return by_label
+
+
+def _highlight_entities(text, entities):
+    """Wrap each entity's span in <...>, using its window-relative offsets
+    (start_in_window/end_in_window) rather than a text search -- a text
+    search would mis-highlight when an entity's surface text repeats
+    elsewhere in the window or is a substring of another entity's text."""
+    ordered = sorted(entities, key=lambda e: e["start_in_window"])
+    out = []
+    cursor = 0
+    for e in ordered:
+        s, en = e["start_in_window"], e["end_in_window"]
+        if s < cursor:
+            continue  # overlaps an already-highlighted span; skip it
+        out.append(text[cursor:s])
+        out.append(f"<{text[s:en]}>")
+        cursor = en
+    out.append(text[cursor:])
+    return "".join(out)
 
 
 # --- Fine-tuned (QLoRA adapter) NER -----------------------------------------

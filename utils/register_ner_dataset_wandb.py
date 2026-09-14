@@ -51,6 +51,7 @@ def main():
     )
     artifact.add_dir(args.input_dir)
     run.log_artifact(artifact)
+    artifact.wait()  # block until the upload commits, so .version below is populated
     run.finish()
 
     ref = f"{args.dataset_artifact}:{artifact.version}"
