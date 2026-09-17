@@ -808,3 +808,55 @@ CONTRIBUTION_TYPES = (
     "software",
 )
 
+# ============================================================================
+# Narrative Extraction Prompts (3-label: TASK, LIMITATION, CONTRIBUTION)
+# ============================================================================
+# Version: v1 (2025-09-17)
+# Purpose: Generative extraction of research narrative components from abstracts
+# Labels: TASK (research area/domain), LIMITATION (gap/challenge), CONTRIBUTION (novel thing)
+# Output: Structured JSON with extracted text (no spans/offsets; text only)
+
+NARRATIVE_SYSTEM_v1 = (
+    "You are an expert at decomposing research papers into structured narrative components. "
+    "Given an abstract, you extract three key research narrative elements and output them as JSON."
+)
+
+NARRATIVE_USER_TEMPLATE_v1 = """Extract the three core narrative components from this research abstract:
+
+1. TASK — the research area, problem domain, or technical topic this paper addresses
+2. LIMITATION — the gap, limitation, or unresolved challenge in existing work that motivates this paper
+3. CONTRIBUTION — the novel thing proposed: algorithm, framework, approach, tool, analysis, or insight
+
+Extract only what is explicitly stated in the abstract. Keep extractions brief and natural.
+
+Return ONLY valid JSON with no prose, no markdown, no code fences:
+{{"TASK": "<extracted task>", "LIMITATION": "<extracted limitation>", "CONTRIBUTION": "<extracted contribution>"}}
+
+## EXAMPLE 1 (Multimodal Vision-Language)
+
+ABSTRACT: The success of large language models (LLMs) has inspired multimodal learning. However, pre-trained LLMs with billions of parameters are difficult to fine-tune efficiently for vision tasks. Models like MiniGPT-4 and LLaVA have been developed but remain limited in artistic image understanding. We propose ArtGPT-4, a large vision-language model tailored for artistic comprehension. It integrates specialized adapter layers into the LLM for efficient artistic image parsing. Trained on 0.52M image-text pairs in 2 hours on a Tesla A100, ArtGPT-4 achieves state-of-the-art on ArtEmis and ArtEmis-v2.0 datasets.
+
+OUTPUT:
+{{"TASK": "multimodal vision-language models for artistic image comprehension", "LIMITATION": "existing models like MiniGPT-4 and LLaVA are limited in understanding artistic imagery and require fine-tuning the entire LLM", "CONTRIBUTION": "ArtGPT-4: a vision-language model with specialized adapter layers for efficient artistic image understanding, trainable in 2 hours on 0.52M image-text pairs"}}
+
+## EXAMPLE 2 (Vision Transformers)
+
+ABSTRACT: Transformer architecture is standard for NLP but limited in computer vision, typically used with CNNs. We show that pure transformers applied directly to image patches can perform well on image classification. Vision Transformer (ViT) pre-trained on large datasets and transferred to ImageNet, CIFAR-100, VTAB achieves excellent results compared to state-of-the-art CNNs while requiring fewer computational resources to train.
+
+OUTPUT:
+{{"TASK": "applying transformer architectures directly to image classification", "LIMITATION": "transformers in vision are typically combined with CNNs; their standalone effectiveness on images is unclear", "CONTRIBUTION": "Vision Transformer (ViT): a pure transformer architecture applied directly to image patch sequences that achieves competitive results with fewer computational resources than CNN-based approaches"}}
+
+## EXAMPLE 3 (Physics - Entropy Functions)
+
+ABSTRACT: Multiple entropy functions (Bekenstein-Hawking, Tsallis, Rényi, Barrow, Sharma-Mittal, Kaniadakis, Loop Quantum Gravity) are proposed for black hole thermodynamics and cosmology, but no unified framework exists. We propose a new 4-parameter generalized entropy function that converges to known entropies in limiting cases. Extended to non-singular cosmology, it provides singular-free evolution and fundamental understanding of entropy. We address implications for black hole thermodynamics and cosmology with various entropic parameter constraints.
+
+OUTPUT:
+{{"TASK": "generalized entropy functions for black hole thermodynamics and cosmology", "LIMITATION": "multiple disparate entropy functions (Bekenstein-Hawking, Tsallis, Rényi, etc.) exist but no unified generalized framework connects them", "CONTRIBUTION": "a 4-parameter generalized entropy function that unifies known entropies in limiting cases, extended to non-singular cosmology for singular-free evolution"}}
+
+Now annotate this abstract:
+
+ABSTRACT:
+{abstract}
+"""
+
+NARRATIVE_LABELS_v1 = ("TASK", "LIMITATION", "CONTRIBUTION")
