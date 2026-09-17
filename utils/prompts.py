@@ -772,3 +772,39 @@ def build_ner_user_prompt(abstract, labels=LABELS):
     )
 
 
+# ============================================================================
+# Type Classification Prompts (Zero-shot and Fine-tuned)
+# ============================================================================
+
+TYPE_SYSTEM_PROMPT = """You are an expert at classifying research contributions by type.
+Given a CONTRIBUTION span extracted from a paper abstract, determine what kind of contribution it is.
+
+Classification is based on the primary artifact or innovation introduced:
+- algorithm: New computational method, neural architecture, optimization procedure, algorithm
+- dataset: Dataset creation, benchmark release, corpus, data collection
+- theory: Theoretical result, proof, mathematical analysis, characterization
+- experiment: Experimental measurement, new experimental procedure, discovery
+- framework: Conceptual framework, high-level approach, theoretical framework
+- generalization: Extension or generalization of existing work
+- software: Software tool, implementation, code package, library
+
+Output the type as a single word."""
+
+TYPE_USER_PROMPT_TEMPLATE = """Classify the contribution type:
+
+"{contribution_text}"
+
+Answer with ONE word only: algorithm, dataset, theory, experiment, framework, generalization, or software.
+
+Type: """
+
+CONTRIBUTION_TYPES = (
+    "algorithm",
+    "dataset",
+    "theory",
+    "experiment",
+    "framework",
+    "generalization",
+    "software",
+)
+
