@@ -1,33 +1,10 @@
-__pycache__/
-*.py[cod]
-*$py.class
+# Track only .py and .md files; ignore everything else.
+*
+!*/
+!*.py
+!*.md
+!.gitignore
 
-.venv/
-venv/
-env/
-
-.env
-.env.*
-!.env.example
-
-# Training outputs and downloaded model artifacts
-checkpoints/
-outputs/
-models/
-*.safetensors
-
-# Local datasets and experiment logs
-*.jsonl
-wandb/
-runs/
-.tensorboard/
-
-# IDE and OS files
-.vscode/
-.idea/
-.DS_Store
-
-*.json
-*.txt
-*.bin
-*.lock
+# Never track data or model artifacts, even .md files inside them.
+data/
+model/
