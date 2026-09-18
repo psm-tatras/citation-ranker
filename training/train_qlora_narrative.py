@@ -204,6 +204,8 @@ def train_qlora_narrative(
     print(f"\n[1/6] Downloading dataset artifact '{dataset_artifact_ref}' from W&B...")
     try:
         artifact = wandb.use_artifact(dataset_artifact_ref)
+        print(f"  Version: {artifact.version}")
+        print(f"  Description: {artifact.description or '(no description)'}")
         needed_files = {train_artifact_file, val_artifact_file}
         downloaded = {}
         for name in needed_files:
