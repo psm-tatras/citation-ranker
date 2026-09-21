@@ -36,6 +36,7 @@ from utils.load_model import (
     WANDB_ADAPTER_ARTIFACT_NAME,
     load_latest_adapter,
 )
+from utils.save_model import BestCheckpointS3WandbCallback
 
 load_dotenv()
 
@@ -439,6 +440,23 @@ def train_qlora(
             loss = compute_weighted_loss(outputs.logits, inputs['labels'], class_weights)
             return (loss, outputs) if return_outputs else loss
     
+    # Saves+uploads a new best train/eval checkpoint to S3 + W&B immediately
+    # whenever loss improves, so a premature stop (crash, KeyboardInterrupt,
+    # preemption) never loses progress.
+    best_checkpoint_callback = BestCheckpointS3WandbCallback(
+        tokenizer=tokenizer,
+        s3_bucket=s3_bucket,
+        s3_key_prefix_root=s3_key_prefix,
+        wandb_run=run,
+        adapter_artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
+        artifact_metadata_extra={
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "dataset_artifact": dataset_artifact_ref,
+        },
+        tmp_root=str(output_dir / "_best_tmp"),
+    )
+
     # Create trainer with weighted loss
     trainer = WeightedSFTTrainer(
         model=model,
@@ -448,7 +466,8 @@ def train_qlora(
         args=training_args,
         packing=True,  # Concatenate sequences for efficiency
         max_seq_length=max_seq_length,
-        formatting_func=formatting_func
+        formatting_func=formatting_func,
+        callbacks=[best_checkpoint_callback],
     )
     
     # Train

@@ -34,9 +34,9 @@ from dotenv import load_dotenv
 
 from utils.load_model import (
     WANDB_PROJECT,
-    WANDB_ADAPTER_ARTIFACT_NAME,
     load_latest_adapter,
 )
+from utils.save_model import BestCheckpointS3WandbCallback
 
 load_dotenv()
 
@@ -44,7 +44,13 @@ load_dotenv()
 # Configuration — values can be provided in .env or overridden by CLI options
 # ---------------------------------------------------------------------------
 S3_BUCKET = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-S3_KEY_PREFIX = os.getenv("S3_KEY_PREFIX") or os.getenv("AWS_MODEL_DIRECTORY", "")
+# Narrative gets its own S3 root, separate from NER's S3_KEY_PREFIX/AWS_MODEL_DIRECTORY.
+S3_KEY_PREFIX = os.getenv("S3_KEY_PREFIX_NARRATIVE") or os.getenv("AWS_NARRATIVE_MODEL_DIRECTORY", "")
+
+# NOT utils.load_model.WANDB_ADAPTER_ARTIFACT_NAME -- that's shared with
+# train_qlora.py (NER). Narrative needs its own name/env var so the two never
+# collide regardless of how WANDB_ADAPTER_ARTIFACT_NAME is set.
+WANDB_ADAPTER_ARTIFACT_NAME = os.getenv("WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME", "qwen-narrative-adapter")
 
 WANDB_DATASET_ARTIFACT = os.getenv("WANDB_DATASET_ARTIFACT", "dataset-narrative-6000:latest")
 WANDB_DATASET_PROJECT = os.getenv("WANDB_DATASET_PROJECT", "")
@@ -89,15 +95,19 @@ def upload_to_s3(local_dir: Path, s3_bucket: str, s3_key_prefix: str) -> str:
         S3 URI of the uploaded model (e.g., 's3://bucket/prefix')
     """
     s3_client = boto3.client("s3")
-    
+
     uploaded_count = 0
     for local_file in local_dir.rglob("*"):
         if not local_file.is_file():
             continue
-        
-        # Construct S3 key: prefix + relative path from local_dir
-        relative_path = local_file.relative_to(local_dir)
-        s3_key = f"{s3_key_prefix}/{relative_path}".replace("\\", "/")
+
+        # Construct S3 key: prefix + relative path from local_dir.parent, so
+        # the uploaded "adapter_model/" folder name is preserved in the key
+        # (matching train_qlora.py's upload_to_s3 and what
+        # utils.load_model.load_latest_adapter() expects: files nested under
+        # {prefix}/adapter_model/, not directly under {prefix}/).
+        relative_path = local_file.relative_to(local_dir.parent)
+        s3_key = f"{s3_key_prefix.rstrip('/')}/{relative_path}".replace("\\", "/")
         
         s3_client.upload_file(
             Filename=str(local_file),
@@ -306,6 +316,24 @@ def train_qlora_narrative(
         run_name=f"qwen-narrative-lora-rank{lora_rank}",
     )
     
+    # Saves+uploads a new best train/eval checkpoint to S3 + W&B immediately
+    # whenever loss improves, so a premature stop (crash, KeyboardInterrupt,
+    # preemption) never loses progress the way run 5ugz915w did on 2026-09-18.
+    best_checkpoint_callback = BestCheckpointS3WandbCallback(
+        tokenizer=tokenizer,
+        s3_bucket=s3_bucket,
+        s3_key_prefix_root=s3_key_prefix,
+        wandb_run=run,
+        adapter_artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
+        artifact_metadata_extra={
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+            "labels": ["TASK", "LIMITATION", "CONTRIBUTION"],
+            "dataset_artifact": dataset_artifact_ref,
+        },
+        tmp_root=str(output_dir / "_best_tmp"),
+    )
+
     # Create trainer (standard SFTTrainer — no class weighting needed for balanced 3-label scheme)
     trainer = SFTTrainer(
         model=model,
@@ -315,7 +343,8 @@ def train_qlora_narrative(
         args=training_args,
         packing=False,  # Chat format doesn't benefit from packing
         max_seq_length=max_seq_length,
-        formatting_func=formatting_func
+        formatting_func=formatting_func,
+        callbacks=[best_checkpoint_callback],
     )
     
     # Train
@@ -421,15 +450,15 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", default=None, help="W&B run name (default: auto-generated)")
     parser.add_argument("--mode", choices=["new", "resume"], default=TRAINING_MODE,
                          help="'new' trains from scratch; 'resume' loads adapter weights from S3 first")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=2e-4)
-    parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--warmup-steps", type=int, default=200)
     parser.add_argument("--lora-rank", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--max-seq-length", type=int, default=2048)
-    parser.add_argument("--save-steps", type=int, default=100)
+    parser.add_argument("--save-steps", type=int, default=50)
     
     args = parser.parse_args()
 
