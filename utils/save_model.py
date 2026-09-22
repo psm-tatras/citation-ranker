@@ -25,6 +25,10 @@ W&B: two independently-versioned artifact collections, so ":latest" on each
 always resolves to the best-so-far of that specific kind:
   {adapter_artifact_name}-train-best  (pruned to 1 version -- effectively overwritten)
   {adapter_artifact_name}-eval-best   (full version history kept)
+
+Each W&B artifact is METADATA ONLY (s3_uri/s3_bucket/s3_key_prefix + the
+training metrics) -- the adapter files themselves are never uploaded to W&B,
+only to S3, to avoid duplicating (and paying to store) the weights twice.
 """
 
 import datetime
@@ -147,9 +151,11 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
                     "timestamp": datetime.datetime.now().isoformat(),
                 },
             )
-            artifact.add_dir(str(adapter_dir))
+            # Deliberately NOT artifact.add_dir(...) -- weights already live in
+            # S3 (s3_uri above); this is a metadata-only pointer to that S3
+            # location, not a second copy of the weights in W&B.
             self.wandb_run.log_artifact(artifact)
-            print(f"✓ New best {kind} ({metric_name}={metric_value:.4f}) -> {s3_uri}  (W&B: {artifact_name})")
+            print(f"✓ New best {kind} ({metric_name}={metric_value:.4f}) -> {s3_uri}  (W&B: {artifact_name}, metadata only)")
 
             if overwrite:
                 # Wait for the version to be assigned server-side, then prune

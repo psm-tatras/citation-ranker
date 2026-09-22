@@ -402,10 +402,11 @@ def train_qlora_narrative(
         }
     )
     
-    # Add adapter files to artifact
-    adapter_artifact.add_dir(str(output_dir / "adapter_model"))
-    
-    # Also add a file with S3 location for easy reference
+    # Deliberately NOT adapter_artifact.add_dir(...) -- the adapter files
+    # already live in S3 (s3_uri above); this artifact is a metadata-only
+    # pointer to that S3 location, not a second copy of the weights in W&B.
+
+    # Local reference file only (not uploaded to W&B).
     if s3_uri:
         s3_info_file = output_dir / "S3_LOCATION.txt"
         with open(s3_info_file, 'w') as f:
@@ -413,10 +414,9 @@ def train_qlora_narrative(
             f.write(f"Bucket: {s3_bucket}\n")
             f.write(f"Key Prefix: {run_s3_prefix}\n")
             f.write(f"Uploaded: {datetime.datetime.now().isoformat()}\n")
-        adapter_artifact.add_file(str(s3_info_file))
-    
+
     run.log_artifact(adapter_artifact)
-    print(f"✓ Model registered in W&B with S3 location")
+    print(f"✓ Model registered in W&B (metadata only -- weights live in S3)")
     
     # Finalize W&B run
     run.finish()
@@ -487,3 +487,37 @@ if __name__ == "__main__":
         mode=args.mode,
         run_name=args.run_name,
     )
+
+# Example run (values matching a real prior run, "Run-Sep21-reduced-lr-narrative").
+# Run from the project root (~/seku-crd-citation-processor) as a module -- NOT
+# `python training/train_qlora_narrative.py`, which only puts training/ on the
+# import path and fails with "ModuleNotFoundError: No module named 'utils'".
+# (Equivalently: `PYTHONPATH=. python training/train_qlora_narrative.py ...`)
+#
+# python -m training.train_qlora_narrative \
+#     --model Qwen/Qwen2.5-7B-Instruct \
+#     --train-file training_data_train.jsonl \
+#     --val-file training_data_val.jsonl \
+#     --output-dir checkpoints/qwen_narrative \
+#     --wandb-project psm-iiser-citation-relevancy \
+#     --dataset-artifact dataset-narrative-6000:latest \
+#     --dataset-wandb-project psm-iiser-citation-relevancy \
+#     --train-artifact-file synthetic_dgft_abstracts_6000_narrative_train.jsonl \
+#     --val-artifact-file synthetic_dgft_abstracts_6000_narrative_val.jsonl \
+#     --run-name Run-Sep22-reduced-lr-narrative \
+#     --mode new \
+#     --epochs 2 \
+#     --batch-size 2 \
+#     --grad-accumulation 4 \
+#     --learning-rate 5e-5 \
+#     --warmup-steps 200 \
+#     --lora-rank 16 \
+#     --lora-alpha 32 \
+#     --max-seq-length 2048 \
+#     --save-steps 50
+#
+# --train-file/--val-file are ignored once --dataset-artifact download
+# succeeds (it overwrites train_file/val_file with the downloaded paths) --
+# they're only used as a fallback label before that point, so any value works.
+# For --mode resume, drop --dataset-artifact and friends if you want the same
+# dataset artifact as the run being resumed, or override them to switch datasets.

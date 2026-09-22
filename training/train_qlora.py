@@ -527,10 +527,11 @@ def train_qlora(
         }
     )
     
-    # Add adapter files to artifact
-    adapter_artifact.add_dir(str(output_dir / "adapter_model"))
-    
-    # Also add a file with S3 location for easy reference
+    # Deliberately NOT adapter_artifact.add_dir(...) -- the adapter files
+    # already live in S3 (s3_uri above); this artifact is a metadata-only
+    # pointer to that S3 location, not a second copy of the weights in W&B.
+
+    # Local reference file only (not uploaded to W&B).
     if s3_uri:
         s3_info_file = output_dir / "S3_LOCATION.txt"
         with open(s3_info_file, 'w') as f:
@@ -538,10 +539,9 @@ def train_qlora(
             f.write(f"Bucket: {s3_bucket}\n")
             f.write(f"Key Prefix: {run_s3_prefix}\n")
             f.write(f"Uploaded: {datetime.datetime.now().isoformat()}\n")
-        adapter_artifact.add_file(str(s3_info_file))
-    
+
     run.log_artifact(adapter_artifact)
-    print(f"✓ Model registered in W&B with S3 location")
+    print(f"✓ Model registered in W&B (metadata only -- weights live in S3)")
     
     # Finalize W&B run
     run.finish()
