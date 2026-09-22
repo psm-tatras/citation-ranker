@@ -557,6 +557,16 @@ def train_qlora(
     # Deliberately NOT adapter_artifact.add_dir(...) -- the adapter files
     # already live in S3 (s3_uri above); this artifact is a metadata-only
     # pointer to that S3 location, not a second copy of the weights in W&B.
+    #
+    # A tiny pointer file IS attached (not the weights): W&B's "already
+    # exists with the same content, no new version created" dedup check is
+    # based on the file manifest, not the metadata dict -- with zero files,
+    # every registration has an identical (empty) manifest, so W&B would
+    # silently keep reusing the very first version forever and this run's
+    # actual metadata would never get persisted. Writing the metadata itself
+    # as a small JSON file gives each version genuinely different content.
+    with adapter_artifact.new_file("pointer.json", mode="w") as f:
+        json.dump(adapter_artifact.metadata, f, indent=2, default=str)
 
     # Local reference file only (not uploaded to W&B).
     if s3_uri:

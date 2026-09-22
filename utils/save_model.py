@@ -32,6 +32,7 @@ only to S3, to avoid duplicating (and paying to store) the weights twice.
 """
 
 import datetime
+import json
 from pathlib import Path
 
 import boto3
@@ -191,6 +192,18 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
             # Deliberately NOT artifact.add_dir(...) -- weights already live in
             # S3 (s3_uri above); this is a metadata-only pointer to that S3
             # location, not a second copy of the weights in W&B.
+            #
+            # A tiny pointer file IS attached (not the weights) because W&B's
+            # "already exists with the same content, no new version created"
+            # dedup check is based on the artifact's file manifest, not its
+            # metadata dict -- with zero files, every save has an identical
+            # (empty) manifest, so W&B silently reuses the same version
+            # forever and the new metadata (loss/step/timestamp) never
+            # actually gets persisted. Writing the metadata itself as a
+            # few-hundred-byte JSON file gives each version genuinely
+            # different content, so a new version is created every time.
+            with artifact.new_file("pointer.json", mode="w") as f:
+                json.dump(artifact.metadata, f, indent=2, default=str)
             self.wandb_run.log_artifact(artifact)
             print(f"✓ New best {kind} ({metric_name}={metric_value:.4f}) -> {s3_uri}  (W&B: {artifact_name}, metadata only)")
 
