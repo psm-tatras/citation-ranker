@@ -11,14 +11,21 @@ downloads the latest adapter via its W&B model artifact
 adapter on top, and offers both a single-abstract predict() and a real
 batched-generation apredict() for many abstracts at once.
 
-NOTE: training/train_qlora_narrative.py currently registers its adapter
-under the SAME W&B artifact name as the NER adapter
-(WANDB_ADAPTER_ARTIFACT_NAME, default "qwen-ner-adapter" -- see
-utils/load_model.py), since it imports that constant rather than defining
-its own. NarrativeModel follows that same resolution by default so it loads
-whatever train_qlora_narrative.py actually registers -- pass an explicit
-`artifact_name` here if/when the training script is given its own artifact
-name.
+The narrative adapter is registered under its OWN W&B artifact name
+(train_qlora_narrative.py's WANDB_ADAPTER_ARTIFACT_NAME, sourced from the
+WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME env var, default "qwen-narrative-adapter")
+-- separate from the NER adapter's "qwen-ner-adapter" -- so NarrativeModel
+resolves "latest" against that name by default, NOT utils.load_model's
+NER-flavored WANDB_ADAPTER_ARTIFACT_NAME constant (do not import/use that
+one here). Required env vars to load successfully:
+  WANDB_PROJECT                         -- must match the project the
+                                            narrative adapter was registered in
+  WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME -- optional; defaults to
+                                            "qwen-narrative-adapter" (matches
+                                            train_qlora_narrative.py's default)
+  AWS creds (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or an IAM role) +
+  AWS_REGION -- to download the adapter files from S3; the bucket/key prefix
+                themselves come from the artifact's own metadata, not env vars
 """
 
 import asyncio
@@ -54,21 +61,35 @@ class NarrativeModel:
     exact chat template it was trained with is used.
 
     local_dir   : where the adapter is downloaded to / then loaded from.
+                  Use a directory distinct from the NER adapter's (e.g. NOT
+                  NER_MODEL_LOCAL_DIR) -- both land at <local_dir>/adapter_model,
+                  so sharing a dir with the NER model would overwrite one
+                  with the other.
     wandb_project, artifact_name : W&B project / model artifact name to
-                  resolve "latest" from; default to utils.load_model's
-                  WANDB_PROJECT / WANDB_ADAPTER_ARTIFACT_NAME (see module
-                  docstring for the current naming caveat).
+                  resolve "latest" from; default to WANDB_PROJECT (env) and
+                  WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME (env, default
+                  "qwen-narrative-adapter") -- see module docstring.
+    checkpoint_kind : None (default) loads the final/full-run adapter;
+                  "train-best" or "eval-best" loads the best-so-far
+                  checkpoint of that kind instead -- registered live during
+                  training by utils.save_model.BestCheckpointS3WandbCallback.
+                  Useful for a run that's still in progress or was
+                  interrupted before finishing.
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
+                checkpoint_kind=None,
                 base_model_id="Qwen/Qwen2.5-7B-Instruct",
                 load_in_4bit=True, dtype="bfloat16", device_map="auto"):
-        from utils.load_model import load_latest_adapter, WANDB_PROJECT, WANDB_ADAPTER_ARTIFACT_NAME
+        import os
+        from utils.load_model import load_latest_adapter, WANDB_PROJECT
 
         adapter_dir = load_latest_adapter(
             Path(local_dir),
             wandb_project=wandb_project or WANDB_PROJECT,
-            artifact_name=artifact_name or WANDB_ADAPTER_ARTIFACT_NAME,
+            artifact_name=artifact_name or os.getenv(
+                "WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME", "qwen-narrative-adapter"),
+            checkpoint_kind=checkpoint_kind,
         )
 
         kwargs = {"device_map": device_map}
@@ -198,13 +219,8 @@ if __name__ == "__main__":
     load_dotenv(project_root / ".env", override=True)
 
     local_dir = os.environ.get("NER_MODEL_LOCAL_DIR", str(project_root / "model"))
-    narrative_model = NarrativeModel(local_dir=local_dir)
+    narrative_model = NarrativeModel(local_dir=local_dir,checkpoint_kind="train-best")
 
-    sample_abstract = (
-        "We present a new method for extracting citation contexts from scientific "
-        "abstracts using a fine-tuned language model. Prior approaches relied on "
-        "hand-crafted rules that failed to generalize across domains. Our approach "
-        "achieves state-of-the-art accuracy on a held-out benchmark of 500 papers."
-    )
+    sample_abstract = """We present the Compressive Transformer, an attentive sequence model which\ncompresses past memories for long-range sequence learning. We find the\nCompressive Transformer obtains state-of-the-art language modelling results in\nthe WikiText-103 and Enwik8 benchmarks, achieving 17.1 ppl and 0.97 bpc\nrespectively. We also find it can model high-frequency speech effectively and\ncan be used as a memory mechanism for RL, demonstrated on an object matching\ntask. To promote the domain of long-range sequence learning, we propose a new\nopen-vocabulary language modelling benchmark derived from books, PG-19."""
     narrative = narrative_model.predict(sample_abstract)
     print(json.dumps(narrative, indent=2))
