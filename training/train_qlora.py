@@ -201,6 +201,7 @@ def train_qlora(
     val_artifact_file: str = WANDB_ARTIFACT_VAL_FILE,
     mode: str = TRAINING_MODE,
     run_name: str = None,
+    resume_checkpoint_kind: str = "final",
     class_weights: dict = None,
 ):
     """
@@ -239,6 +240,13 @@ def train_qlora(
         mode: 'new' starts LoRA training from scratch; 'resume' finds the most
             recent run under s3_bucket/s3_key_prefix and continues training it
         run_name: W&B run name; if None, W&B auto-generates one (e.g. 'young-microwave-2')
+        resume_checkpoint_kind: which artifact 'resume' loads from -- 'final'
+            (default) is the plain WANDB_ADAPTER_ARTIFACT_NAME, only registered
+            when a run completes fully; 'train-best'/'eval-best' load the
+            best-so-far checkpoint of that kind instead, registered live
+            during training by utils.save_model.BestCheckpointS3WandbCallback
+            -- use one of these to resume a run that was interrupted before
+            it could register a 'final' artifact.
     """
     # trl is only needed for actual training (not for resolving/downloading
     # the adapter via utils.load_model), so it's kept out of module-level
@@ -353,10 +361,11 @@ def train_qlora(
             wandb_project=wandb_project,
             artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
             wandb_run=run,
+            checkpoint_kind=None if resume_checkpoint_kind == "final" else resume_checkpoint_kind,
         )
         model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
         print("=" * 70)
-        print(f"✓ WEIGHTS LOADED FROM S3: {adapter_path}")
+        print(f"✓ WEIGHTS LOADED FROM S3 (checkpoint_kind={resume_checkpoint_kind}): {adapter_path}")
         print("=" * 70)
     else:
         lora_config = setup_lora_config(lora_rank=lora_rank, lora_alpha=lora_alpha)
@@ -577,6 +586,10 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", default=None, help="W&B run name (default: auto-generated)")
     parser.add_argument("--mode", choices=["new", "resume"], default=TRAINING_MODE,
                          help="'new' trains from scratch; 'resume' loads adapter weights from S3 first")
+    parser.add_argument("--resume-checkpoint-kind", choices=["final", "train-best", "eval-best"], default="final",
+                         help="Which artifact --mode resume loads: 'final' (default) is only registered when a "
+                              "run completes fully; use 'train-best'/'eval-best' to resume a run that was "
+                              "interrupted before finishing")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation", type=int, default=4)
@@ -621,5 +634,6 @@ if __name__ == "__main__":
         val_artifact_file=args.val_artifact_file,
         mode=args.mode,
         run_name=args.run_name,
+        resume_checkpoint_kind=args.resume_checkpoint_kind,
         class_weights=args.class_weights,
     )

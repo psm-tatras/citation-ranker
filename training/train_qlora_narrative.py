@@ -150,6 +150,7 @@ def train_qlora_narrative(
     val_artifact_file: str = WANDB_ARTIFACT_VAL_FILE,
     mode: str = TRAINING_MODE,
     run_name: str = None,
+    resume_checkpoint_kind: str = "final",
 ):
     """
     Fine-tune Qwen2.5-7B with QLoRA on research narrative extraction.
@@ -179,6 +180,13 @@ def train_qlora_narrative(
         val_artifact_file: name of the validation-data file inside the artifact
         mode: 'new' starts LoRA training from scratch; 'resume' loads adapter from S3
         run_name: W&B run name; if None, W&B auto-generates one
+        resume_checkpoint_kind: which artifact 'resume' loads from -- 'final'
+            (default) is the plain WANDB_ADAPTER_ARTIFACT_NAME, only registered
+            when a run completes fully; 'train-best'/'eval-best' load the
+            best-so-far checkpoint of that kind instead, registered live
+            during training by utils.save_model.BestCheckpointS3WandbCallback
+            -- use one of these to resume a run that was interrupted before
+            it could register a 'final' artifact.
     """
     # trl is only needed for actual training, so pulled in here
     from trl import SFTTrainer
@@ -269,10 +277,11 @@ def train_qlora_narrative(
             wandb_project=wandb_project,
             artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
             wandb_run=run,
+            checkpoint_kind=None if resume_checkpoint_kind == "final" else resume_checkpoint_kind,
         )
         model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
         print("=" * 70)
-        print(f"✓ WEIGHTS LOADED FROM S3: {adapter_path}")
+        print(f"✓ WEIGHTS LOADED FROM S3 (checkpoint_kind={resume_checkpoint_kind}): {adapter_path}")
         print("=" * 70)
     else:
         lora_config = setup_lora_config(lora_rank=lora_rank, lora_alpha=lora_alpha)
@@ -450,6 +459,10 @@ if __name__ == "__main__":
     parser.add_argument("--run-name", default=None, help="W&B run name (default: auto-generated)")
     parser.add_argument("--mode", choices=["new", "resume"], default=TRAINING_MODE,
                          help="'new' trains from scratch; 'resume' loads adapter weights from S3 first")
+    parser.add_argument("--resume-checkpoint-kind", choices=["final", "train-best", "eval-best"], default="final",
+                         help="Which artifact --mode resume loads: 'final' (default) is only registered when a "
+                              "run completes fully; use 'train-best'/'eval-best' to resume a run that was "
+                              "interrupted before finishing")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation", type=int, default=4)
@@ -486,6 +499,7 @@ if __name__ == "__main__":
         val_artifact_file=args.val_artifact_file,
         mode=args.mode,
         run_name=args.run_name,
+        resume_checkpoint_kind=args.resume_checkpoint_kind,
     )
 
 # Example run (values matching a real prior run, "Run-Sep21-reduced-lr-narrative").
@@ -521,3 +535,26 @@ if __name__ == "__main__":
 # they're only used as a fallback label before that point, so any value works.
 # For --mode resume, drop --dataset-artifact and friends if you want the same
 # dataset artifact as the run being resumed, or override them to switch datasets.
+
+# Resuming a run that was interrupted before it could register a 'final'
+# artifact (KeyboardInterrupt, crash, preemption): add --resume-checkpoint-kind
+# train-best (most recent progress) or eval-best (best generalization, updates
+# once per eval) -- otherwise --mode resume silently falls back to 'final',
+# which may be stale or not exist at all. See train_qlora_narrative()'s
+# resume_checkpoint_kind docstring for the tradeoff between the two kinds.
+#
+# python -m training.train_qlora_narrative \
+#     --wandb-project psm-iiser-citation-relevancy \
+#     --dataset-artifact dataset-narrative-6000:latest \
+#     --dataset-wandb-project psm-iiser-citation-relevancy \
+#     --train-artifact-file synthetic_dgft_abstracts_6000_narrative_train.jsonl \
+#     --val-artifact-file synthetic_dgft_abstracts_6000_narrative_val.jsonl \
+#     --run-name Run-Sep22-resume-from-train-best \
+#     --mode resume \
+#     --resume-checkpoint-kind train-best \
+#     --epochs 2 \
+#     --batch-size 2 \
+#     --grad-accumulation 4 \
+#     --learning-rate 5e-5 \
+#     --warmup-steps 200 \
+#     --save-steps 50
