@@ -36,7 +36,7 @@ from utils.load_model import (
     WANDB_PROJECT,
     load_latest_adapter,
 )
-from utils.save_model import BestCheckpointS3WandbCallback
+from utils.save_model import BestCheckpointS3WandbCallback, lookup_best_loss
 
 load_dotenv()
 
@@ -328,6 +328,22 @@ def train_qlora_narrative(
     # Saves+uploads a new best train/eval checkpoint to S3 + W&B immediately
     # whenever loss improves, so a premature stop (crash, KeyboardInterrupt,
     # preemption) never loses progress the way run 5ugz915w did on 2026-09-18.
+    #
+    # On resume, seed the "best so far" baselines from whatever's already
+    # recorded in W&B (regardless of which checkpoint_kind we just loaded
+    # WEIGHTS from) -- otherwise these would reset to +inf and the very next
+    # logged loss would immediately count as "best" and trigger a save even
+    # if it's actually worse than the checkpoint being resumed from.
+    if mode == "resume":
+        initial_best_train_loss = lookup_best_loss(
+            wandb_project, WANDB_ADAPTER_ARTIFACT_NAME, "train-best", "train_loss")
+        initial_best_eval_loss = lookup_best_loss(
+            wandb_project, WANDB_ADAPTER_ARTIFACT_NAME, "eval-best", "eval_loss")
+        print(f"Resume baselines: train_loss={initial_best_train_loss}, eval_loss={initial_best_eval_loss}")
+    else:
+        initial_best_train_loss = float("inf")
+        initial_best_eval_loss = float("inf")
+
     best_checkpoint_callback = BestCheckpointS3WandbCallback(
         tokenizer=tokenizer,
         s3_bucket=s3_bucket,
@@ -341,6 +357,8 @@ def train_qlora_narrative(
             "dataset_artifact": dataset_artifact_ref,
         },
         tmp_root=str(output_dir / "_best_tmp"),
+        initial_best_train_loss=initial_best_train_loss,
+        initial_best_eval_loss=initial_best_eval_loss,
     )
 
     # Create trainer (standard SFTTrainer — no class weighting needed for balanced 3-label scheme)

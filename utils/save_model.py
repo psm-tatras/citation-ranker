@@ -38,6 +38,37 @@ import boto3
 import wandb
 from transformers import TrainerCallback
 
+from utils.load_model import resolve_latest_adapter_artifact
+
+
+def lookup_best_loss(wandb_project: str, artifact_name: str,
+                      checkpoint_kind: str, metric_name: str) -> float:
+    """
+    Read the loss value recorded in an existing best-checkpoint artifact's
+    metadata (e.g. {adapter_name}-train-best's "train_loss" field), to use as
+    the BASELINE a resumed run's new checkpoints must beat -- rather than
+    resetting to +inf and immediately treating the very first logged loss as
+    "best" regardless of whether it's actually better than what's already
+    saved. Returns +inf if no such artifact exists yet (e.g. resuming before
+    any eval has happened), so the first genuine result is still accepted.
+
+    Args:
+        wandb_project: W&B project the artifact was logged to
+        artifact_name: base adapter artifact name (e.g. 'qwen-narrative-adapter')
+        checkpoint_kind: 'train-best' or 'eval-best'
+        metric_name: metadata key to read ('train_loss' or 'eval_loss')
+    """
+    try:
+        artifact = resolve_latest_adapter_artifact(
+            wandb_project=wandb_project,
+            artifact_name=artifact_name,
+            checkpoint_kind=checkpoint_kind,
+        )
+        value = artifact.metadata.get(metric_name)
+        return float(value) if value is not None else float("inf")
+    except Exception:
+        return float("inf")
+
 
 def upload_dir_to_s3(local_dir: Path, s3_bucket: str, s3_key_prefix: str) -> str:
     """
@@ -84,7 +115,9 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
                  wandb_run, adapter_artifact_name: str,
                  artifact_metadata_extra: dict = None,
                  tmp_root: str = "checkpoints/_best_tmp",
-                 overwrite_kinds=frozenset({"train"})):
+                 overwrite_kinds=frozenset({"train"}),
+                 initial_best_train_loss: float = float("inf"),
+                 initial_best_eval_loss: float = float("inf")):
         self.tokenizer = tokenizer
         self.s3_bucket = s3_bucket
         self.s3_key_prefix_root = s3_key_prefix_root.rstrip("/")
@@ -93,8 +126,12 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
         self.artifact_metadata_extra = artifact_metadata_extra or {}
         self.tmp_root = Path(tmp_root)
         self.overwrite_kinds = overwrite_kinds
-        self.best_train_loss = float("inf")
-        self.best_eval_loss = float("inf")
+        # For a fresh run these stay +inf (any first result counts as best).
+        # For a resumed run, the caller passes in the loss already recorded
+        # against the checkpoint being resumed from (see lookup_best_loss),
+        # so only a genuine improvement over that baseline triggers a save.
+        self.best_train_loss = initial_best_train_loss
+        self.best_eval_loss = initial_best_eval_loss
 
     def _prune_old_versions(self, artifact_name: str, keep_version: str):
         """Delete every other version in this W&B artifact collection, so
