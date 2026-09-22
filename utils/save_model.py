@@ -11,14 +11,20 @@ recovered manually on 2026-09-18. BestCheckpointS3WandbCallback saves+uploads
 a new best-so-far checkpoint immediately whenever train loss or eval loss
 improves, so progress always survives, no matter how the run ends.
 
-S3 layout (train and eval checkpoints kept in separate subtrees):
-  {s3_key_prefix_root}/train_best/<DDMMYY-HHMMSS>/adapter_model/...
-  {s3_key_prefix_root}/eval_best/<DDMMYY-HHMMSS>/adapter_model/...
+S3 layout:
+  - "overwrite" kinds (train, by default -- it updates far more often than
+    eval) use a FIXED path, re-uploaded in place each time, and W&B prunes
+    every older version after logging a new one -- so both S3 and W&B only
+    ever hold the single current best, no accumulation:
+      {s3_key_prefix_root}/train_best/adapter_model/...
+  - other kinds (eval, by default -- naturally much less frequent, once per
+    eval) keep a full timestamped history in both S3 and W&B:
+      {s3_key_prefix_root}/eval_best/<DDMMYY-HHMMSS>/adapter_model/...
 
 W&B: two independently-versioned artifact collections, so ":latest" on each
 always resolves to the best-so-far of that specific kind:
-  {adapter_artifact_name}-train-best
-  {adapter_artifact_name}-eval-best
+  {adapter_artifact_name}-train-best  (pruned to 1 version -- effectively overwritten)
+  {adapter_artifact_name}-eval-best   (full version history kept)
 """
 
 import datetime
@@ -73,7 +79,8 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
     def __init__(self, tokenizer, s3_bucket: str, s3_key_prefix_root: str,
                  wandb_run, adapter_artifact_name: str,
                  artifact_metadata_extra: dict = None,
-                 tmp_root: str = "checkpoints/_best_tmp"):
+                 tmp_root: str = "checkpoints/_best_tmp",
+                 overwrite_kinds=frozenset({"train"})):
         self.tokenizer = tokenizer
         self.s3_bucket = s3_bucket
         self.s3_key_prefix_root = s3_key_prefix_root.rstrip("/")
@@ -81,19 +88,43 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
         self.adapter_artifact_name = adapter_artifact_name
         self.artifact_metadata_extra = artifact_metadata_extra or {}
         self.tmp_root = Path(tmp_root)
+        self.overwrite_kinds = overwrite_kinds
         self.best_train_loss = float("inf")
         self.best_eval_loss = float("inf")
+
+    def _prune_old_versions(self, artifact_name: str, keep_version: str):
+        """Delete every other version in this W&B artifact collection, so
+        only keep_version (the one just logged) remains -- the net effect of
+        "overwrite" using the standard artifact API (:latest still works via
+        load_latest_adapter() exactly as before, since there's only ever one
+        version present)."""
+        try:
+            api = wandb.Api()
+            collection_path = f"{self.wandb_run.entity}/{self.wandb_run.project}/{artifact_name}"
+            for art in api.artifacts("model", collection_path):
+                if art.version != keep_version:
+                    try:
+                        art.delete()
+                    except Exception as e:
+                        print(f"    (could not delete old {artifact_name}:{art.version}: {e})")
+        except Exception as e:
+            print(f"    (could not prune old versions of {artifact_name}: {e})")
 
     def _save_and_upload(self, model, kind, metric_name, metric_value, state):
         # A transient S3/W&B hiccup here must not crash the training run --
         # that would throw away hours of GPU work over a checkpoint upload.
         try:
+            overwrite = kind in self.overwrite_kinds
             adapter_dir = self.tmp_root / kind / "adapter_model"
             model.save_pretrained(adapter_dir)
             self.tokenizer.save_pretrained(adapter_dir)
 
-            timestamp = datetime.datetime.now().strftime("%d%m%y-%H%M%S")
-            s3_prefix = f"{self.s3_key_prefix_root}/{kind}_best/{timestamp}"
+            if overwrite:
+                # Fixed path, re-uploaded in place -- no timestamp, no accumulation.
+                s3_prefix = f"{self.s3_key_prefix_root}/{kind}_best"
+            else:
+                timestamp = datetime.datetime.now().strftime("%d%m%y-%H%M%S")
+                s3_prefix = f"{self.s3_key_prefix_root}/{kind}_best/{timestamp}"
             s3_uri = upload_dir_to_s3(adapter_dir, self.s3_bucket, s3_prefix)
 
             artifact_name = f"{self.adapter_artifact_name}-{kind}-best"
@@ -119,6 +150,12 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
             artifact.add_dir(str(adapter_dir))
             self.wandb_run.log_artifact(artifact)
             print(f"✓ New best {kind} ({metric_name}={metric_value:.4f}) -> {s3_uri}  (W&B: {artifact_name})")
+
+            if overwrite:
+                # Wait for the version to be assigned server-side, then prune
+                # every other version so this collection stays at exactly 1.
+                artifact.wait()
+                self._prune_old_versions(artifact_name, artifact.version)
         except Exception as e:
             print(f"✗ Failed to save/upload best-{kind} checkpoint ({metric_name}={metric_value:.4f}): {e}")
             print("  Continuing training -- this checkpoint just won't be persisted.")
