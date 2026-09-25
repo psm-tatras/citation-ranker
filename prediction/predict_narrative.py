@@ -1,9 +1,19 @@
 """
 Inference for the QLoRA-fine-tuned narrative-extraction model
-(training/train_qlora_narrative.py): given an abstract, predict the
-3-label narrative decomposition -- TASK, LIMITATION, CONTRIBUTION -- using
-the EXACT same prompt (NARRATIVE_SYSTEM_v1 / NARRATIVE_USER_TEMPLATE_v1) the
-model was trained on, so inference matches training.
+(training/train_qlora_narrative.py): given an abstract, predict its
+narrative decomposition using the EXACT same prompt the model was trained
+on, so inference matches training.
+
+Label scheme is selected with NarrativeModel(..., version=...), resolved
+against the same NARRATIVE_VERSIONS registry (utils/prompts.py) that
+training/train_data_generator/synthetic_narrative_labelling_dataset_building.py
+uses to build the SFT data -- generation and inference can never disagree on
+which system/template/labels go together. Defaults to "v1" because that is
+the only version an adapter has actually been trained on so far; pass
+version="v2" once a v2 adapter has been trained and is the one being loaded
+-- loading a v2 adapter while predicting with the v1 prompt (or vice versa)
+silently reintroduces the exact train/inference prompt mismatch this
+registry exists to prevent.
 
 Mirrors prediction/predict_ner_v2.py's FineTunedNERModel: resolves and
 downloads the latest adapter via its W&B model artifact
@@ -37,16 +47,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel
 
 from .slm_generate import extract_json
-from utils.prompts import NARRATIVE_SYSTEM_v1, NARRATIVE_USER_TEMPLATE_v1, NARRATIVE_LABELS_v1
+from utils.prompts import NARRATIVE_VERSIONS
 
 
-def _normalize_narrative(obj):
-    """Ensure every NARRATIVE_LABELS_v1 key is present as a string, so callers
-    get a predictable shape regardless of what the model actually returned."""
+def _normalize_narrative(obj, labels):
+    """Ensure every label in `labels` is present as a string, so callers get
+    a predictable shape regardless of what the model actually returned."""
     if not isinstance(obj, dict):
         obj = {}
     return {label: (obj[label] if isinstance(obj.get(label), str) else "")
-            for label in NARRATIVE_LABELS_v1}
+            for label in labels}
 
 
 class NarrativeModel:
@@ -75,14 +85,27 @@ class NarrativeModel:
                   training by utils.save_model.BestCheckpointS3WandbCallback.
                   Useful for a run that's still in progress or was
                   interrupted before finishing.
+    version     : which NARRATIVE_VERSIONS entry (utils/prompts.py) the
+                  loaded adapter was actually trained on -- selects the
+                  system/user prompt and label set predict()/apredict() use.
+                  Default "v1": the only version an adapter has been trained
+                  on so far. MUST match the adapter you're loading; passing
+                  "v2" while loading a v1-trained adapter (or vice versa)
+                  reintroduces a train/inference prompt mismatch.
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
-                checkpoint_kind=None,
+                checkpoint_kind=None, version="v1",
                 base_model_id="Qwen/Qwen2.5-7B-Instruct",
                 load_in_4bit=True, dtype="bfloat16", device_map="auto"):
         import os
         from utils.load_model import load_latest_adapter, WANDB_PROJECT
+
+        version_cfg = NARRATIVE_VERSIONS[version]
+        self.version = version
+        self.system_prompt = version_cfg["system"]
+        self.user_template = version_cfg["template"]
+        self.labels = list(version_cfg["labels"])
 
         adapter_dir = load_latest_adapter(
             Path(local_dir),
@@ -114,14 +137,19 @@ class NarrativeModel:
             trust_remote_code=True,
         )
 
-    def predict(self, abstract, max_new_tokens=256):
-        """Predict {TASK, LIMITATION, CONTRIBUTION} for one abstract, using
-        the exact prompt training data was built with. Returns a dict with
-        all three keys always present (empty string for anything the model
-        didn't produce / that failed to parse)."""
+    def predict(self, abstract, max_new_tokens=400):
+        """Predict this instance's version-selected labels for one abstract,
+        using the exact prompt training data was built with. Returns a dict
+        with all labels always present (empty string for anything the model
+        didn't produce / that failed to parse).
+
+        max_new_tokens default: v2's 5-field assistant JSON measured up to
+        269 tokens on a 20-abstract sample (see synthetic_narrative_labelling
+        _dataset_building.py dry runs); 400 keeps >20% headroom above that.
+        Re-check this at full-dataset scale before relying on it for v2."""
         messages = [
-            {"role": "system", "content": NARRATIVE_SYSTEM_v1},
-            {"role": "user", "content": NARRATIVE_USER_TEMPLATE_v1.format(abstract=abstract)},
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": self.user_template.format(abstract=abstract)},
         ]
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
@@ -136,9 +164,9 @@ class NarrativeModel:
             obj = extract_json(raw)
         except Exception:
             obj = {}
-        return _normalize_narrative(obj)
+        return _normalize_narrative(obj, self.labels)
 
-    async def apredict(self, items, batch_size=8, max_new_tokens=256):
+    async def apredict(self, items, batch_size=8, max_new_tokens=400):
         """Async batched version of predict(). Like FineTunedNERModel.apredict
         (predict_ner_v2.py), this does REAL batched generation: items are
         grouped into chunks of `batch_size`, each chunk tokenized together
@@ -170,8 +198,8 @@ class NarrativeModel:
         prompts = [
             self.tokenizer.apply_chat_template(
                 [
-                    {"role": "system", "content": NARRATIVE_SYSTEM_v1},
-                    {"role": "user", "content": NARRATIVE_USER_TEMPLATE_v1.format(abstract=abstract)},
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": self.user_template.format(abstract=abstract)},
                 ],
                 tokenize=False, add_generation_prompt=True,
             )
@@ -202,9 +230,9 @@ class NarrativeModel:
             try:
                 gen = seq[prompt_len:]
                 raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
-                narrative = _normalize_narrative(extract_json(raw))
+                narrative = _normalize_narrative(extract_json(raw), self.labels)
             except Exception:
-                narrative = _normalize_narrative({})
+                narrative = _normalize_narrative({}, self.labels)
             results.append({"id": item_id, "narrative": narrative})
         return results
 

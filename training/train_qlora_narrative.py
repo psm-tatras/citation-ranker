@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 QLoRA fine-tuning script for Qwen2.5-7B-Instruct narrative extraction.
-3-label scheme: TASK, LIMITATION, CONTRIBUTION
+Label scheme selected via --version (utils/prompts.py NARRATIVE_VERSIONS):
+  v1 (default): TASK, LIMITATION, CONTRIBUTION
+  v2:           TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT
 With W&B dataset integration and S3 model upload.
 
 This uses:
@@ -151,10 +153,11 @@ def train_qlora_narrative(
     mode: str = TRAINING_MODE,
     run_name: str = None,
     resume_checkpoint_kind: str = "final",
+    version: str = "v1",
 ):
     """
     Fine-tune Qwen2.5-7B with QLoRA on research narrative extraction.
-    3-label scheme: TASK, LIMITATION, CONTRIBUTION
+    Label scheme is selected via `version` (see its docstring below).
     Uploads best model to S3 and registers in W&B.
     
     Args:
@@ -187,13 +190,23 @@ def train_qlora_narrative(
             during training by utils.save_model.BestCheckpointS3WandbCallback
             -- use one of these to resume a run that was interrupted before
             it could register a 'final' artifact.
+        version: which NARRATIVE_VERSIONS entry (utils/prompts.py) the
+            dataset_artifact was actually built with -- this only affects
+            the label list recorded in W&B run config / checkpoint metadata
+            / the final adapter's description (training itself just trains
+            on whatever "messages" are in the downloaded JSONL, regardless
+            of this value). MUST match dataset_artifact's real label scheme,
+            or every W&B record for this run will misreport what it trained on.
     """
+    from utils.prompts import NARRATIVE_VERSIONS
+    labels = list(NARRATIVE_VERSIONS[version]["labels"])
+
     # trl is only needed for actual training, so pulled in here
     from trl import SFTTrainer
 
     print("=" * 70)
     print("QLoRA Fine-Tuning: Qwen2.5-7B-Instruct for Narrative Extraction")
-    print("Labels: TASK, LIMITATION, CONTRIBUTION")
+    print(f"Version: {version}  Labels: {', '.join(labels)}")
     print("=" * 70)
 
     # Initialize W&B
@@ -211,7 +224,8 @@ def train_qlora_narrative(
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
             "max_seq_length": max_seq_length,
-            "labels": ["TASK", "LIMITATION", "CONTRIBUTION"],
+            "version": version,
+            "labels": labels,
         }
     )
     
@@ -353,7 +367,8 @@ def train_qlora_narrative(
         artifact_metadata_extra={
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
-            "labels": ["TASK", "LIMITATION", "CONTRIBUTION"],
+            "version": version,
+            "labels": labels,
             "dataset_artifact": dataset_artifact_ref,
         },
         tmp_root=str(output_dir / "_best_tmp"),
@@ -416,11 +431,13 @@ def train_qlora_narrative(
     adapter_artifact = wandb.Artifact(
         name=WANDB_ADAPTER_ARTIFACT_NAME,
         type="model",
-        description=f"QLoRA adapter (rank={lora_rank}) fine-tuned on narrative extraction (3-label: TASK/LIMITATION/CONTRIBUTION)",
+        description=f"QLoRA adapter (rank={lora_rank}) fine-tuned on narrative extraction "
+                    f"({version}, {len(labels)}-label: {'/'.join(labels)})",
         metadata={
             "lora_rank": lora_rank,
             "lora_alpha": lora_alpha,
-            "labels": ["TASK", "LIMITATION", "CONTRIBUTION"],
+            "version": version,
+            "labels": labels,
             "dataset_artifact": dataset_artifact_ref,
             "s3_uri": s3_uri if s3_uri else "upload-failed",
             "s3_bucket": s3_bucket,
@@ -491,6 +508,10 @@ if __name__ == "__main__":
                          help="Which artifact --mode resume loads: 'final' (default) is only registered when a "
                               "run completes fully; use 'train-best'/'eval-best' to resume a run that was "
                               "interrupted before finishing")
+    parser.add_argument("--version", choices=["v1", "v2"], default="v1",
+                         help="Which NARRATIVE_VERSIONS label scheme (utils/prompts.py) --dataset-artifact was "
+                              "built with -- only affects the label list recorded in W&B; MUST match the "
+                              "dataset's real scheme or W&B will misreport what this run trained on")
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--grad-accumulation", type=int, default=4)
@@ -528,6 +549,7 @@ if __name__ == "__main__":
         mode=args.mode,
         run_name=args.run_name,
         resume_checkpoint_kind=args.resume_checkpoint_kind,
+        version=args.version,
     )
 
 # Example run (values matching a real prior run, "Run-Sep21-reduced-lr-narrative").
@@ -563,6 +585,32 @@ if __name__ == "__main__":
 # they're only used as a fallback label before that point, so any value works.
 # For --mode resume, drop --dataset-artifact and friends if you want the same
 # dataset artifact as the run being resumed, or override them to switch datasets.
+
+# v2 (5-label: + METHOD/RESULT) example -- same as above but pointed at the
+# v2 dataset artifact, with --version v2 so W&B run config / checkpoint
+# metadata / the final adapter's description correctly record 5 labels
+# instead of silently claiming this is a v1 (3-label) model:
+#
+# python -m training.train_qlora_narrative \
+#     --model Qwen/Qwen2.5-7B-Instruct \
+#     --output-dir checkpoints/qwen_narrative_v2 \
+#     --wandb-project psm-iiser-citation-relevancy \
+#     --dataset-artifact dataset-narrative-v2-5label:latest \
+#     --dataset-wandb-project psm-iiser-citation-relevancy \
+#     --train-artifact-file synthetic_dgft_abstracts_6000_narrative_train.jsonl \
+#     --val-artifact-file synthetic_dgft_abstracts_6000_narrative_val.jsonl \
+#     --version v2 \
+#     --run-name Run-narrative-v2 \
+#     --mode new \
+#     --epochs 2 \
+#     --batch-size 2 \
+#     --grad-accumulation 4 \
+#     --learning-rate 5e-5 \
+#     --warmup-steps 200 \
+#     --lora-rank 16 \
+#     --lora-alpha 32 \
+#     --max-seq-length 2048 \
+#     --save-steps 50
 
 # Resuming a run that was interrupted before it could register a 'final'
 # artifact (KeyboardInterrupt, crash, preemption): add --resume-checkpoint-kind

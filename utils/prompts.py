@@ -860,3 +860,92 @@ ABSTRACT:
 """
 
 NARRATIVE_LABELS_v1 = ("TASK", "LIMITATION", "CONTRIBUTION")
+# ============================================================================
+# NARRATIVE EXTRACTION v2 (5 labels): TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT
+# ============================================================================
+# Purpose: v1 + METHOD and RESULT, needed for M-R relation functions (USES/COMPARES)
+# Field roles: CONTRIBUTION = what is new; METHOD = how it is done (incl. existing
+#              data/tools/techniques used); RESULT = what was found or measured
+# Missing fields: "" (empty string) when the abstract does not state them
+
+NARRATIVE_SYSTEM_v2 = (
+    "You are an expert at decomposing research papers into structured narrative components. "
+    "Given an abstract, you extract five key research narrative elements and output them as JSON."
+)
+
+NARRATIVE_USER_TEMPLATE_v2 = """Extract the five core narrative components from this research abstract:
+
+1. TASK — the research area, problem domain, or technical topic this paper addresses
+2. LIMITATION — the gap, limitation, or unresolved challenge in existing work that motivates this paper
+3. CONTRIBUTION — WHAT the paper adds: a one-line headline naming it and its kind (method/model, dataset/benchmark, software/tool, theoretical result, analysis/study, review/survey, or insight). Every paper has one: if nothing new is built, the contribution is the study or analysis itself (e.g. "a phenomenological analysis of X at the LHC")
+4. METHOD — HOW the work is done: techniques, experimental or theoretical approach, data, tools, and settings used (including existing ones the paper relies on)
+5. RESULT — WHAT was found: measured outcomes, observed findings, or proven/demonstrated conclusions
+
+Field roles:
+- Keep each field focused on its role. CONTRIBUTION names the new thing; METHOD describes how it works or how it was obtained; RESULT reports outcomes. Do not copy the same phrase into several fields.
+- Numbers, benchmark scores, and comparisons with prior work belong in RESULT, not CONTRIBUTION.
+- TASK and CONTRIBUTION are always non-empty. Only LIMITATION, METHOD and RESULT may be "" when the abstract does not state them. Do not invent content.
+- Review/survey and software/tool papers often state no METHOD or RESULT; leave those fields "" rather than filling them with the CONTRIBUTION.
+
+Extract only what is explicitly stated in the abstract. Keep extractions brief and natural.
+
+Return ONLY valid JSON with no prose, no markdown, no code fences:
+{{"TASK": "<extracted task>", "LIMITATION": "<extracted limitation>", "CONTRIBUTION": "<extracted contribution>", "METHOD": "<extracted method>", "RESULT": "<extracted result>"}}
+
+## EXAMPLE 1 (Multimodal Vision-Language)
+
+ABSTRACT: The success of large language models (LLMs) has inspired multimodal learning. However, pre-trained LLMs with billions of parameters are difficult to fine-tune efficiently for vision tasks. Models like MiniGPT-4 and LLaVA have been developed but remain limited in artistic image understanding. We propose ArtGPT-4, a large vision-language model tailored for artistic comprehension. It integrates specialized adapter layers into the LLM for efficient artistic image parsing. Trained on 0.52M image-text pairs in 2 hours on a Tesla A100, ArtGPT-4 achieves state-of-the-art on ArtEmis and ArtEmis-v2.0 datasets.
+
+OUTPUT:
+{{"TASK": "multimodal vision-language models for artistic image comprehension", "LIMITATION": "existing models like MiniGPT-4 and LLaVA are limited in understanding artistic imagery and require fine-tuning the entire LLM", "CONTRIBUTION": "ArtGPT-4: a large vision-language model tailored for artistic image comprehension", "METHOD": "specialized adapter layers integrated into a pre-trained LLM, trained on 0.52M image-text pairs in 2 hours on a single Tesla A100", "RESULT": "state-of-the-art performance on the ArtEmis and ArtEmis-v2.0 datasets"}}
+
+## EXAMPLE 2 (Vision Transformers)
+
+ABSTRACT: Transformer architecture is standard for NLP but limited in computer vision, typically used with CNNs. We show that pure transformers applied directly to image patches can perform well on image classification. Vision Transformer (ViT) pre-trained on large datasets and transferred to ImageNet, CIFAR-100, VTAB achieves excellent results compared to state-of-the-art CNNs while requiring fewer computational resources to train.
+
+OUTPUT:
+{{"TASK": "applying transformer architectures directly to image classification", "LIMITATION": "transformers in vision are typically combined with CNNs; their standalone effectiveness on images is unclear", "CONTRIBUTION": "Vision Transformer (ViT): showing that a pure transformer without CNNs performs well on image classification", "METHOD": "a pure transformer applied to sequences of image patches, pre-trained on large datasets and transferred to ImageNet, CIFAR-100 and VTAB", "RESULT": "excellent results compared to state-of-the-art CNNs while requiring fewer computational resources to train"}}
+
+## EXAMPLE 3 (Physics - Entropy Functions)
+
+ABSTRACT: Multiple entropy functions (Bekenstein-Hawking, Tsallis, Rényi, Barrow, Sharma-Mittal, Kaniadakis, Loop Quantum Gravity) are proposed for black hole thermodynamics and cosmology, but no unified framework exists. We propose a new 4-parameter generalized entropy function that converges to known entropies in limiting cases. Extended to non-singular cosmology, it provides singular-free evolution and fundamental understanding of entropy. We address implications for black hole thermodynamics and cosmology with various entropic parameter constraints.
+
+OUTPUT:
+{{"TASK": "generalized entropy functions for black hole thermodynamics and cosmology", "LIMITATION": "multiple disparate entropy functions (Bekenstein-Hawking, Tsallis, Rényi, etc.) exist but no unified generalized framework connects them", "CONTRIBUTION": "a 4-parameter generalized entropy function unifying the known entropy functions", "METHOD": "analytical construction of the generalized entropy, checked against known entropies in limiting cases and extended to non-singular cosmology", "RESULT": "the function reduces to the known entropies in limiting cases and yields singular-free cosmological evolution, with constraints on the entropic parameters"}}
+
+Now annotate this abstract:
+
+ABSTRACT:
+{abstract}
+"""
+
+NARRATIVE_LABELS_v2 = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
+
+# ============================================================================
+# NARRATIVE VERSION REGISTRY -- single source of truth for which
+# system/user/labels go together, so data generation
+# (training/train_data_generator/synthetic_narrative_labelling_dataset_building.py)
+# and inference (prediction/predict_narrative.py) can never drift apart by
+# each hardcoding a different v* constant. Both import NARRATIVE_VERSIONS
+# from here rather than importing NARRATIVE_SYSTEM_v1/v2 etc. directly.
+# ============================================================================
+NARRATIVE_VERSIONS = {
+    "v1": {
+        "system": NARRATIVE_SYSTEM_v1,
+        "template": NARRATIVE_USER_TEMPLATE_v1,
+        "labels": NARRATIVE_LABELS_v1,
+        "description": "3-label narrative extraction: TASK, LIMITATION, CONTRIBUTION",
+        "optional": set(),
+    },
+    "v2": {
+        "system": NARRATIVE_SYSTEM_v2,
+        "template": NARRATIVE_USER_TEMPLATE_v2,
+        "labels": NARRATIVE_LABELS_v2,
+        "description": "5-label narrative extraction: TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT",
+        # Only TASK and CONTRIBUTION are guaranteed stated in an abstract.
+        # The v2 prompt explicitly tells the model to leave a component ""
+        # when the abstract doesn't state it (and calls out METHOD/RESULT by
+        # name for review/survey/software papers).
+        "optional": {"LIMITATION", "METHOD", "RESULT"},
+    },
+}
