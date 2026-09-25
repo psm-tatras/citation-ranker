@@ -621,11 +621,12 @@ if __name__ == "__main__":
 #
 # python -m training.train_qlora_narrative \
 #     --wandb-project psm-iiser-citation-relevancy \
-#     --dataset-artifact dataset-narrative-6000:latest \
+#     --dataset-artifact dataset-narrative-v2-5label:latest \
 #     --dataset-wandb-project psm-iiser-citation-relevancy \
 #     --train-artifact-file synthetic_dgft_abstracts_6000_narrative_train.jsonl \
 #     --val-artifact-file synthetic_dgft_abstracts_6000_narrative_val.jsonl \
-#     --run-name Run-Sep22-resume-from-train-best \
+#     --version v2 \
+#     --run-name Run-narrative-v2-resume-from-train-best \
 #     --mode resume \
 #     --resume-checkpoint-kind train-best \
 #     --epochs 2 \
