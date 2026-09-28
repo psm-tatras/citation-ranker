@@ -69,9 +69,10 @@ def download_from_s3(s3_bucket: str, s3_key_prefix: str, local_dir: Path) -> Pat
 def resolve_latest_adapter_artifact(wandb_project: str = WANDB_PROJECT,
                                      artifact_name: str = WANDB_ADAPTER_ARTIFACT_NAME,
                                      wandb_run=None,
-                                     checkpoint_kind: str = None):
+                                     checkpoint_kind: str = None,
+                                     version: str = "latest"):
     """
-    Look up the most recent trained-adapter W&B model artifact.
+    Look up a trained-adapter W&B model artifact (by default, the latest one).
 
     Args:
         wandb_project: W&B project the artifact was logged to
@@ -86,12 +87,15 @@ def resolve_latest_adapter_artifact(wandb_project: str = WANDB_PROJECT,
             DURING training by utils.save_model.BestCheckpointS3WandbCallback
             under "{artifact_name}-{checkpoint_kind}" -- useful for loading
             progress from a run that's still in progress or was interrupted.
+        version: the artifact's W&B version alias, e.g. "latest" (default)
+            or a specific pinned version like "v61" -- for reproducing /
+            testing an exact checkpoint rather than whatever is newest now.
 
     Returns:
         The W&B Artifact object (its .metadata holds s3_bucket/s3_key_prefix)
     """
     name = f"{artifact_name}-{checkpoint_kind}" if checkpoint_kind else artifact_name
-    reference = f"{name}:latest"
+    reference = f"{name}:{version}"
     if wandb_run is not None:
         return wandb_run.use_artifact(reference)
     return wandb.Api().artifact(f"{wandb_project}/{reference}")
@@ -101,29 +105,31 @@ def load_latest_adapter(local_dir: Path,
                          wandb_project: str = WANDB_PROJECT,
                          artifact_name: str = WANDB_ADAPTER_ARTIFACT_NAME,
                          wandb_run=None,
-                         checkpoint_kind: str = None) -> Path:
+                         checkpoint_kind: str = None,
+                         version: str = "latest") -> Path:
     """
-    Resolve the latest trained adapter via its W&B artifact and download it.
-    The S3 bucket and key prefix both come from the artifact's own metadata
-    (written by train_qlora.py when it registers the artifact) -- the
-    artifact is the single source of truth for where its weights live.
+    Resolve a trained adapter via its W&B artifact (latest by default, or a
+    pinned version) and download it. The S3 bucket and key prefix both come
+    from the artifact's own metadata (written by train_qlora.py when it
+    registers the artifact) -- the artifact is the single source of truth
+    for where its weights live.
 
     Args:
         local_dir: directory to download the adapter into
-        wandb_project, artifact_name, wandb_run, checkpoint_kind: see
-            resolve_latest_adapter_artifact
+        wandb_project, artifact_name, wandb_run, checkpoint_kind, version:
+            see resolve_latest_adapter_artifact
 
     Returns:
         Path to the downloaded adapter directory (local_dir/adapter_model),
         containing adapter_config.json / adapter weights.
     """
     resolved_name = f"{artifact_name}-{checkpoint_kind}" if checkpoint_kind else artifact_name
-    print(f"Looking up '{resolved_name}:latest' in W&B project '{wandb_project}'...")
+    print(f"Looking up '{resolved_name}:{version}' in W&B project '{wandb_project}'...")
     try:
-        artifact = resolve_latest_adapter_artifact(wandb_project, artifact_name, wandb_run, checkpoint_kind)
+        artifact = resolve_latest_adapter_artifact(wandb_project, artifact_name, wandb_run, checkpoint_kind, version)
     except Exception as e:
         raise RuntimeError(
-            f"Could not find a previous '{resolved_name}' model artifact in "
+            f"Could not find a '{resolved_name}:{version}' model artifact in "
             f"W&B project '{wandb_project}': {e}"
         )
 

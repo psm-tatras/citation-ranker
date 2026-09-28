@@ -92,8 +92,33 @@ def _sanitize_json_escapes(s):
     starting a valid JSON escape, and neutralize raw control chars, so the
     object parses. Math-heavy surface strings may then not match the abstract
     verbatim and get dropped by resolve_offsets -- acceptable; the clean spans
-    in the same record survive instead of losing the whole record."""
-    s = re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', s)
+    in the same record survive instead of losing the whole record.
+
+    Scans left-to-right and consumes an already-valid escape (\\", \\\\, \\/,
+    \\b, \\f, \\n, \\r, \\t, \\uXXXX) as one atomic unit rather than matching
+    each backslash independently -- a regex like r'\\\\(?!["\\\\/bfnrtu])'
+    mis-handles a run of backslashes: on an already-valid "\\\\" (escaped
+    backslash) it leaves the first backslash alone (next char looks like a
+    valid escape start) but then re-examines the SECOND backslash on its own
+    and "fixes" it too, turning a valid 2-backslash sequence into an invalid
+    3-backslash one -- which is exactly the kind of mixed \\lesssim (invalid)
+    / \\\\lambda (already-valid) output real completions produce side by side."""
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "u" and i + 5 < n and all(ch in "0123456789abcdefABCDEF" for ch in s[i + 2:i + 6]):
+                out.append(s[i:i + 6]); i += 6; continue
+            if nxt in '"\\/bfnrtu':
+                out.append(s[i:i + 2]); i += 2; continue
+            out.append("\\\\")  # lone backslash not starting a valid escape
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    s = "".join(out)
     s = s.replace("\t", " ").replace("\r", " ")
     return s
 

@@ -85,17 +85,25 @@ class NarrativeModel:
                   training by utils.save_model.BestCheckpointS3WandbCallback.
                   Useful for a run that's still in progress or was
                   interrupted before finishing.
+    wandb_version : the W&B artifact's version alias -- "latest" (default)
+                  or a specific pinned version like "v61", to reproduce /
+                  test an exact checkpoint rather than whatever is newest.
+                  NOT the same thing as `version` below (that's the prompt
+                  scheme; this is the W&B artifact version tag).
     version     : which NARRATIVE_VERSIONS entry (utils/prompts.py) the
                   loaded adapter was actually trained on -- selects the
                   system/user prompt and label set predict()/apredict() use.
                   Default "v1": the only version an adapter has been trained
                   on so far. MUST match the adapter you're loading; passing
                   "v2" while loading a v1-trained adapter (or vice versa)
-                  reintroduces a train/inference prompt mismatch.
+                  reintroduces a train/inference prompt mismatch. Check the
+                  W&B artifact's own metadata["version"] if unsure -- e.g.
+                  qwen-narrative-adapter-train-best:v61's metadata records
+                  "version": "v2".
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
-                checkpoint_kind=None, version="v1",
+                checkpoint_kind=None, wandb_version="latest", version="v1",
                 base_model_id="Qwen/Qwen2.5-7B-Instruct",
                 load_in_4bit=True, dtype="bfloat16", device_map="auto"):
         import os
@@ -113,6 +121,7 @@ class NarrativeModel:
             artifact_name=artifact_name or os.getenv(
                 "WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME", "qwen-narrative-adapter"),
             checkpoint_kind=checkpoint_kind,
+            version=wandb_version,
         )
 
         kwargs = {"device_map": device_map}
@@ -162,7 +171,13 @@ class NarrativeModel:
         raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
         try:
             obj = extract_json(raw)
-        except Exception:
+        except Exception as e:
+            hit_cap = len(gen) >= max_new_tokens
+            print(f"[NarrativeModel.predict] JSON parse failed ({e}); "
+                  f"generated {len(gen)}/{max_new_tokens} tokens"
+                  + (" -- HIT max_new_tokens, response was likely truncated"
+                     " (raise max_new_tokens)" if hit_cap else "") + ".")
+            print(f"[NarrativeModel.predict] raw output:\n{raw}")
             obj = {}
         return _normalize_narrative(obj, self.labels)
 
@@ -227,11 +242,16 @@ class NarrativeModel:
         prompt_len = inputs["input_ids"].shape[1]
         results = []
         for item_id, seq in zip(ids, out):
+            gen = seq[prompt_len:]
+            raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
             try:
-                gen = seq[prompt_len:]
-                raw = self.tokenizer.decode(gen, skip_special_tokens=True).strip()
                 narrative = _normalize_narrative(extract_json(raw), self.labels)
-            except Exception:
+            except Exception as e:
+                hit_cap = int((gen != self.tokenizer.pad_token_id).sum()) >= max_new_tokens
+                print(f"[NarrativeModel._generate_batch] id={item_id!r} JSON parse failed ({e})"
+                      + (" -- may have HIT max_new_tokens, response possibly truncated"
+                         " (raise max_new_tokens)" if hit_cap else "") + ".")
+                print(f"[NarrativeModel._generate_batch] id={item_id!r} raw output:\n{raw}")
                 narrative = _normalize_narrative({}, self.labels)
             results.append({"id": item_id, "narrative": narrative})
         return results
@@ -246,8 +266,13 @@ if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent.parent
     load_dotenv(project_root / ".env", override=True)
 
-    local_dir = os.environ.get("NER_MODEL_LOCAL_DIR", str(project_root / "model"))
-    narrative_model = NarrativeModel(local_dir=local_dir,checkpoint_kind="train-best")
+    local_dir = os.environ.get("NARRATIVE_MODEL_LOCAL_DIR", str(project_root / "model" / "narrative"))
+    narrative_model = NarrativeModel(
+        local_dir=local_dir,
+        checkpoint_kind="train-best",
+        wandb_version="latest",
+        version="v2",          # must match whatever :latest actually is -- check its metadata["version"] if unsure
+    )
 
     sample_abstract = """We present the Compressive Transformer, an attentive sequence model which\ncompresses past memories for long-range sequence learning. We find the\nCompressive Transformer obtains state-of-the-art language modelling results in\nthe WikiText-103 and Enwik8 benchmarks, achieving 17.1 ppl and 0.97 bpc\nrespectively. We also find it can model high-frequency speech effectively and\ncan be used as a memory mechanism for RL, demonstrated on an object matching\ntask. To promote the domain of long-range sequence learning, we propose a new\nopen-vocabulary language modelling benchmark derived from books, PG-19."""
     narrative = narrative_model.predict(sample_abstract)
