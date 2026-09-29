@@ -182,7 +182,7 @@ class CitationContextExtractor:
         positions = [m.start() for m in re.finditer(re.escape(marker), text)]
         return min(positions, key=lambda p: abs(p - hint)) if positions else -1
 
-def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_context_extractor:CitationContextExtractor,output_dir:str,max_refs:int=32):
+def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_context_extractor:CitationContextExtractor,output_dir:str=None,max_refs:int=32):
     """Find and save citation contexts for a main paper's in-corpus references.
 
     Looks up main_paper_id in bulk_paper_index for its in_corpus_references,
@@ -216,6 +216,7 @@ def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_conte
         would clobber each other's temp file.
     """
     status = False
+    final_dict = {}
     try:
         citation_contexts = {}
         # read main paper content
@@ -245,15 +246,16 @@ def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_conte
             print(e)
             pass
         # done, collected from all refs
-        # dump in output path
         final_dict = {main_paper_id:{"references":citation_contexts,"abstract":main_paper_abstract}}
-        op_fname = os.path.join(output_dir,f"{main_paper_id}.json")
-        with open(op_fname,"w") as f:
-            json.dump(final_dict,f,indent=2)
+        if output_dir:
+            # dump in output path
+            op_fname = os.path.join(output_dir,f"{main_paper_id}.json")
+            with open(op_fname,"w") as f:
+                json.dump(final_dict,f,indent=2)
         status = True
     except Exception as e:
         print(e)
-    return status
+    return status,final_dict
 
 if __name__ == "__main__":
     import sys
