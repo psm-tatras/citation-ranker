@@ -39,6 +39,7 @@ one here). Required env vars to load successfully:
 """
 
 import asyncio
+import re
 from pathlib import Path
 
 import torch
@@ -57,6 +58,41 @@ def _normalize_narrative(obj, labels):
         obj = {}
     return {label: (obj[label] if isinstance(obj.get(label), str) else "")
             for label in labels}
+
+
+def _regex_extract_labels(raw, labels):
+    """Last-resort fallback for when extract_json can't parse the raw
+    completion at all. This happens not just from bad backslash escapes
+    (extract_json's own sanitizer handles that) but also from the model
+    emitting a stray, unescaped quote INSIDE a value -- which closes the
+    JSON string early, and no amount of escape-repair can recover from that
+    ambiguity through strict brace/quote-balanced parsing.
+
+    For each label, in order, finds '"<LABEL>": "' and takes everything up
+    to the START of the next label's '"<NEXT_LABEL>":' as the value --
+    anchored on the next KEY rather than a closing quote character, so a
+    stray quote in the middle of a value doesn't truncate it (the value
+    naturally spans both sides of the stray quote instead).
+
+    Returns {} if none of the labels' keys could be found at all (raw is
+    too garbled to be worth trusting)."""
+    result = {}
+    for i, label in enumerate(labels):
+        m = re.search(rf'"{re.escape(label)}"\s*:\s*"?', raw)
+        if not m:
+            continue
+        start = m.end()
+        end = len(raw)
+        for next_label in labels[i + 1:]:
+            nm = re.search(rf'"{re.escape(next_label)}"\s*:', raw[start:])
+            if nm:
+                end = start + nm.start()
+                break
+        value = raw[start:end].rstrip()
+        value = re.sub(r'[",}\s]+$', '', value)  # trailing quote/comma/brace left from the value's own punctuation
+        value = value.replace('\\"', '"').replace("\\\\", "\\")
+        result[label] = value
+    return result
 
 
 class NarrativeModel:
@@ -178,7 +214,9 @@ class NarrativeModel:
                   + (" -- HIT max_new_tokens, response was likely truncated"
                      " (raise max_new_tokens)" if hit_cap else "") + ".")
             print(f"[NarrativeModel.predict] raw output:\n{raw}")
-            obj = {}
+            obj = _regex_extract_labels(raw, self.labels)
+            if obj:
+                print(f"[NarrativeModel.predict] recovered via regex fallback: {sorted(obj.keys())}")
         return _normalize_narrative(obj, self.labels)
 
     async def apredict(self, items, batch_size=8, max_new_tokens=400):
@@ -252,7 +290,11 @@ class NarrativeModel:
                       + (" -- may have HIT max_new_tokens, response possibly truncated"
                          " (raise max_new_tokens)" if hit_cap else "") + ".")
                 print(f"[NarrativeModel._generate_batch] id={item_id!r} raw output:\n{raw}")
-                narrative = _normalize_narrative({}, self.labels)
+                recovered = _regex_extract_labels(raw, self.labels)
+                if recovered:
+                    print(f"[NarrativeModel._generate_batch] id={item_id!r} "
+                          f"recovered via regex fallback: {sorted(recovered.keys())}")
+                narrative = _normalize_narrative(recovered, self.labels)
             results.append({"id": item_id, "narrative": narrative})
         return results
 

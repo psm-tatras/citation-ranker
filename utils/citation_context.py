@@ -103,7 +103,16 @@ class CitationContextExtractor:
                 candidates.add(doi[len(self.ARXIV_DOI_PREFIX):])
             if ids.get("arxiv_id"):
                 candidates.add(ids["arxiv_id"])
-            candidates.update(bib.get("contained_arXiv_ids") or [])
+            for c in bib.get("contained_arXiv_ids") or []:
+                # unarXive sometimes stores these as {"id","text","start","end"}
+                # span dicts instead of plain id strings -- dicts aren't
+                # hashable, so set.update() on the raw list would crash here
+                # (for EVERY caller, since this loop runs over all bib_entries
+                # regardless of which reference is being looked up).
+                if isinstance(c, dict):
+                    c = c.get("id")
+                if c:
+                    candidates.add(c)
             candidates.update(
                 m.group(1) for m in self.ARXIV_ID_IN_TEXT_RE.finditer(bib.get("bib_entry_raw", "")))
             if target in {self.normalise_arxiv_id(c) for c in candidates}:
@@ -233,20 +242,26 @@ def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_conte
         # but may be, not all references
         if max_refs != -1:
             in_corpus_refs_ids = in_corpus_refs_ids[:min(len(in_corpus_refs_ids),max_refs)]
-        # main loop for each ref papers
-        try:
-            for ref_paper_id in in_corpus_refs_ids:
+        # main loop for each ref papers -- caught PER reference, not around
+        # the whole loop: one bad reference (or a data-format quirk in the
+        # main paper's OWN bib_entries, which extract() re-scans on every
+        # call) must not silently drop every other reference for this paper.
+        successfull = 0
+        for ref_paper_id in in_corpus_refs_ids:
+            try:
                 result = citation_context_extractor.extract(fname, ref_paper_id) # this will be list of dicts for every citation context
                 if result: # non empty list
                     # collect abstract of reference paper
                     ref_paper_text = get_paper_from_s3(ref_paper_id)
                     ref_paper_title,ref_paper_abstract = get_title_and_abstract(ref_paper_text)
                     citation_contexts.update({ref_paper_id:{"citation_context":result,"abstract":ref_paper_abstract}})
-        except Exception as e:
-            print(e)
-            pass
+                    successfull += 1
+            except Exception as e:
+                print(f"  ref {ref_paper_id}: {e}")
+                continue
         # done, collected from all refs
         final_dict = {main_paper_id:{"references":citation_contexts,"abstract":main_paper_abstract}}
+        print(f"Extracted context for {main_paper_id} success [{successfull}/{len(in_corpus_refs_ids)}]")
         if output_dir:
             # dump in output path
             op_fname = os.path.join(output_dir,f"{main_paper_id}.json")
