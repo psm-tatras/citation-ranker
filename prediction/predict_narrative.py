@@ -136,12 +136,29 @@ class NarrativeModel:
                   W&B artifact's own metadata["version"] if unsure -- e.g.
                   qwen-narrative-adapter-train-best:v61's metadata records
                   "version": "v2".
+    shared_model, shared_tokenizer, adapter_name : for sharing ONE loaded
+                  Qwen base across multiple fine-tuned heads (see
+                  prediction/predict_main.py) instead of each wrapper class
+                  loading its own full copy of the 7B base model. Leave both
+                  shared_model/shared_tokenizer as None (default) to load a
+                  standalone base, exactly as before. To share: pass the
+                  OTHER wrapper's already-loaded `.model` (a PeftModel) as
+                  shared_model (and, to skip a redundant tokenizer load, its
+                  `.tokenizer` as shared_tokenizer) -- this adapter is then
+                  attached to that SAME PeftModel under `adapter_name`
+                  (PEFT's multi-adapter support) rather than a second base
+                  being loaded. adapter_name defaults to "narrative"; predict()/
+                  apredict() call self.model.set_adapter(adapter_name) before
+                  every generate() call, so the right adapter is active even
+                  if a sibling wrapper sharing the same model switched it in
+                  between.
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
                 checkpoint_kind=None, wandb_version="latest", version="v1",
                 base_model_id="Qwen/Qwen2.5-7B-Instruct",
-                load_in_4bit=True, dtype="bfloat16", device_map="auto"):
+                load_in_4bit=True, dtype="bfloat16", device_map="auto",
+                shared_model=None, shared_tokenizer=None, adapter_name="narrative"):
         import os
         from utils.load_model import load_latest_adapter, WANDB_PROJECT
 
@@ -150,6 +167,7 @@ class NarrativeModel:
         self.system_prompt = version_cfg["system"]
         self.user_template = version_cfg["template"]
         self.labels = list(version_cfg["labels"])
+        self.adapter_name = adapter_name
 
         adapter_dir = load_latest_adapter(
             Path(local_dir),
@@ -160,27 +178,38 @@ class NarrativeModel:
             version=wandb_version,
         )
 
-        kwargs = {"device_map": device_map}
-        if load_in_4bit:
-            kwargs["quantization_config"] = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=getattr(torch, dtype),
-                bnb_4bit_use_double_quant=True,
-            )
+        if shared_model is not None:
+            # Attach this adapter to an ALREADY-LOADED base/PeftModel instead
+            # of loading a second copy of the 7B base -- see shared_model's
+            # docstring above.
+            shared_model.load_adapter(str(adapter_dir), adapter_name=adapter_name)
+            self.model = shared_model
         else:
-            kwargs["torch_dtype"] = getattr(torch, dtype)
+            kwargs = {"device_map": device_map}
+            if load_in_4bit:
+                kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=getattr(torch, dtype),
+                    bnb_4bit_use_double_quant=True,
+                )
+            else:
+                kwargs["torch_dtype"] = getattr(torch, dtype)
 
-        base = AutoModelForCausalLM.from_pretrained(base_model_id, **kwargs)
-        self.model = PeftModel.from_pretrained(base, str(adapter_dir))
+            base = AutoModelForCausalLM.from_pretrained(base_model_id, **kwargs)
+            self.model = PeftModel.from_pretrained(base, str(adapter_dir), adapter_name=adapter_name)
         self.model.eval()
-        # Adapter uploads contain weights/configuration only. Fall back to the
-        # base model tokenizer when tokenizer files were not uploaded with them.
-        tokenizer_dir = adapter_dir if any(adapter_dir.glob("tokenizer*")) else base_model_id
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            str(tokenizer_dir),
-            trust_remote_code=True,
-        )
+
+        if shared_tokenizer is not None:
+            self.tokenizer = shared_tokenizer
+        else:
+            # Adapter uploads contain weights/configuration only. Fall back to the
+            # base model tokenizer when tokenizer files were not uploaded with them.
+            tokenizer_dir = adapter_dir if any(adapter_dir.glob("tokenizer*")) else base_model_id
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                str(tokenizer_dir),
+                trust_remote_code=True,
+            )
 
     def predict(self, abstract, max_new_tokens=400):
         """Predict this instance's version-selected labels for one abstract,
@@ -199,6 +228,7 @@ class NarrativeModel:
         prompt = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True)
         inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        self.model.set_adapter(self.adapter_name)
         with torch.no_grad():
             out = self.model.generate(
                 **inputs, max_new_tokens=max_new_tokens,
@@ -270,6 +300,7 @@ class NarrativeModel:
         try:
             inputs = self.tokenizer(
                 prompts, return_tensors="pt", padding=True).to(self.model.device)
+            self.model.set_adapter(self.adapter_name)
             with torch.no_grad():
                 out = self.model.generate(
                     **inputs, max_new_tokens=max_new_tokens,
