@@ -54,8 +54,10 @@ load_dotenv()
 # Configuration — values can be provided in .env or overridden by CLI options
 # ---------------------------------------------------------------------------
 S3_BUCKET = os.getenv("S3_BUCKET") or os.getenv("AWS_BUCKET_NAME", "")
-# Context classifier gets its own S3 root, separate from NER's/narrative's.
-S3_KEY_PREFIX = os.getenv("S3_KEY_PREFIX_CONTEXT_CLASSIFIER") or os.getenv("AWS_CONTEXT_CLASSIFIER_MODEL_DIRECTORY", "")
+# Context classifier's own top-level directory within the shared bucket (NOT
+# a separate bucket) -- e.g. s3://psm-iiser/context-classifier/. Each run's
+# own timestamp directory (computed below) sits directly under this prefix.
+S3_KEY_PREFIX = os.getenv("S3_KEY_PREFIX_CONTEXT_CLASSIFIER", "context-classifier")
 
 # NOT utils.load_model.WANDB_ADAPTER_ARTIFACT_NAME -- that's shared with
 # train_qlora.py (NER) and train_qlora_narrative.py. Context classifier needs
@@ -374,10 +376,17 @@ def train_qlora_context_classifier(
         initial_best_train_loss = float("inf")
         initial_best_eval_loss = float("inf")
 
+    # Computed ONCE up front (not just at the end for the final upload), so
+    # train-best/eval-best checkpoints saved DURING training land under the
+    # SAME per-run directory as the final adapter, instead of a bare shared
+    # path that every run of this model would overwrite into.
+    run_timestamp = datetime.datetime.now().strftime("%d%m%y-%H%M%S")
+    run_s3_prefix = f"{s3_key_prefix.rstrip('/')}/{run_timestamp}" if s3_key_prefix else run_timestamp
+
     best_checkpoint_callback = BestCheckpointS3WandbCallback(
         tokenizer=tokenizer,
         s3_bucket=s3_bucket,
-        s3_key_prefix_root=s3_key_prefix,
+        s3_key_prefix_root=run_s3_prefix,
         wandb_run=run,
         adapter_artifact_name=WANDB_ADAPTER_ARTIFACT_NAME,
         artifact_metadata_extra={
@@ -427,9 +436,9 @@ def train_qlora_context_classifier(
     ) / 1e6
     print(f"✓ Adapter size: {adapter_size:.1f} MB")
 
-    # Upload to S3
-    run_timestamp = datetime.datetime.now().strftime("%d%m%y-%H%M%S")
-    run_s3_prefix = f"{s3_key_prefix.rstrip('/')}/{run_timestamp}"
+    # Upload to S3 -- run_s3_prefix was already computed above, before
+    # training started, so this lands under the SAME per-run directory as
+    # the train-best/eval-best checkpoints saved during training.
     print("\n" + "=" * 70)
     print("Uploading to S3...")
     print("=" * 70)

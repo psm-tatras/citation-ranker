@@ -1,25 +1,8 @@
 """
-Generate a readable Markdown report from a facet-prediction JSON file
-(playground/facet_main.ipynb's output, {m_id}.json), written to the SAME
-directory under the same base name (.md instead of .json).
+Generate a Markdown report from a facet-prediction JSON file (facet_main.ipynb
+output), written next to it with a .md extension.
 
-Input JSON shape (as produced by facet_main.ipynb):
-{
-  "m_id": "...", "m_title": "...", "m_abstract": "...",
-  "m_aspects": {"TASK": "...", "LIMITATION": "...", "CONTRIBUTION": "...", "METHOD": "...", ...},
-  "references": {
-    "<r_id>": [{"<r_id>": {
-        "title": "...", "abstract": "...",
-        "aspect": {"TASK": "...", "LIMITATION": "...", "CONTRIBUTION": "...", "METHOD": "...", ...},
-        "m_context": [{"section", "ref_id", "sentence_index", "before", "center", "after"}, ...],
-        "facet_relevance": [{"FUNCTION", "M_ASPECT", "POLARITY", "EVIDENCE", "R_MATCH"}, ...]
-    }}],
-    ...
-  }
-}
-
-Usage
------
+Usage:
     python -m utils.generate_report data/facet_predictions/2302.08982.json
 """
 
@@ -71,6 +54,7 @@ def format_reference(r_id, r_data):
 
 
 def generate_report(data):
+    """Render a facet-prediction dict as Markdown."""
     lines = [
         "# Main Paper Section", "--------------------", "",
         f"**ID:** {data.get('m_id', '')}", "",

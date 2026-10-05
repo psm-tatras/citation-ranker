@@ -1,41 +1,11 @@
 """
-Inference for the QLoRA-fine-tuned narrative-extraction model
-(training/train_qlora_narrative.py): given an abstract, predict its
-narrative decomposition using the EXACT same prompt the model was trained
-on, so inference matches training.
+Inference for the QLoRA-fine-tuned narrative-extraction model.
 
-Label scheme is selected with NarrativeModel(..., version=...), resolved
-against the same NARRATIVE_VERSIONS registry (utils/prompts.py) that
-training/train_data_generator/synthetic_narrative_labelling_dataset_building.py
-uses to build the SFT data -- generation and inference can never disagree on
-which system/template/labels go together. Defaults to "v1" because that is
-the only version an adapter has actually been trained on so far; pass
-version="v2" once a v2 adapter has been trained and is the one being loaded
--- loading a v2 adapter while predicting with the v1 prompt (or vice versa)
-silently reintroduces the exact train/inference prompt mismatch this
-registry exists to prevent.
+Uses the same NARRATIVE_VERSIONS prompt (utils/prompts.py) the adapter was
+trained on; `version` must match the loaded adapter.
 
-Mirrors prediction/predict_ner_v2.py's FineTunedNERModel: resolves and
-downloads the latest adapter via its W&B model artifact
-(utils.load_model.load_latest_adapter), loads the frozen Qwen base with the
-adapter on top, and offers both a single-abstract predict() and a real
-batched-generation apredict() for many abstracts at once.
-
-The narrative adapter is registered under its OWN W&B artifact name
-(train_qlora_narrative.py's WANDB_ADAPTER_ARTIFACT_NAME, sourced from the
-WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME env var, default "qwen-narrative-adapter")
--- separate from the NER adapter's "qwen-ner-adapter" -- so NarrativeModel
-resolves "latest" against that name by default, NOT utils.load_model's
-NER-flavored WANDB_ADAPTER_ARTIFACT_NAME constant (do not import/use that
-one here). Required env vars to load successfully:
-  WANDB_PROJECT                         -- must match the project the
-                                            narrative adapter was registered in
-  WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME -- optional; defaults to
-                                            "qwen-narrative-adapter" (matches
-                                            train_qlora_narrative.py's default)
-  AWS creds (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or an IAM role) +
-  AWS_REGION -- to download the adapter files from S3; the bucket/key prefix
-                themselves come from the artifact's own metadata, not env vars
+Env vars: WANDB_PROJECT, WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME (default
+"qwen-narrative-adapter"), AWS credentials + AWS_REGION.
 """
 
 import asyncio
@@ -52,8 +22,7 @@ from utils.prompts import NARRATIVE_VERSIONS
 
 
 def _normalize_narrative(obj, labels):
-    """Ensure every label in `labels` is present as a string, so callers get
-    a predictable shape regardless of what the model actually returned."""
+    """Return a dict with every label present as a string."""
     if not isinstance(obj, dict):
         obj = {}
     return {label: (obj[label] if isinstance(obj.get(label), str) else "")
@@ -61,21 +30,12 @@ def _normalize_narrative(obj, labels):
 
 
 def _regex_extract_labels(raw, labels):
-    """Last-resort fallback for when extract_json can't parse the raw
-    completion at all. This happens not just from bad backslash escapes
-    (extract_json's own sanitizer handles that) but also from the model
-    emitting a stray, unescaped quote INSIDE a value -- which closes the
-    JSON string early, and no amount of escape-repair can recover from that
-    ambiguity through strict brace/quote-balanced parsing.
+    """Fallback parser for completions that are not valid JSON.
 
-    For each label, in order, finds '"<LABEL>": "' and takes everything up
-    to the START of the next label's '"<NEXT_LABEL>":' as the value --
-    anchored on the next KEY rather than a closing quote character, so a
-    stray quote in the middle of a value doesn't truncate it (the value
-    naturally spans both sides of the stray quote instead).
-
-    Returns {} if none of the labels' keys could be found at all (raw is
-    too garbled to be worth trusting)."""
+    Each value spans from its key to the next label's key, so a stray
+    unescaped quote inside a value does not truncate it. Returns {} if no
+    label is found.
+    """
     result = {}
     for i, label in enumerate(labels):
         m = re.search(rf'"{re.escape(label)}"\s*:\s*"?', raw)
@@ -89,69 +49,27 @@ def _regex_extract_labels(raw, labels):
                 end = start + nm.start()
                 break
         value = raw[start:end].rstrip()
-        value = re.sub(r'[",}\s]+$', '', value)  # trailing quote/comma/brace left from the value's own punctuation
+        value = re.sub(r'[",}\s]+$', '', value)  # trailing quote/comma/brace
         value = value.replace('\\"', '"').replace("\\\\", "\\")
         result[label] = value
     return result
 
 
 class NarrativeModel:
-    """QLoRA fine-tuned narrative-extraction model: resolves the latest
-    trained adapter via its W&B model artifact and downloads it (the same
-    utils.load_model.load_latest_adapter helper train_qlora_narrative.py
-    uses to resume training) into local_dir, then loads the frozen base from
-    HF with the adapter on top.
+    """Narrative-extraction model: Qwen base with the narrative LoRA adapter.
 
-    The base loads in 4-bit by default so it fits a 12 GB GPU, matching how
-    it was trained. The tokenizer is loaded from the adapter dir, so the
-    exact chat template it was trained with is used.
-
-    local_dir   : where the adapter is downloaded to / then loaded from.
-                  Use a directory distinct from the NER adapter's (e.g. NOT
-                  NER_MODEL_LOCAL_DIR) -- both land at <local_dir>/adapter_model,
-                  so sharing a dir with the NER model would overwrite one
-                  with the other.
-    wandb_project, artifact_name : W&B project / model artifact name to
-                  resolve "latest" from; default to WANDB_PROJECT (env) and
-                  WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME (env, default
-                  "qwen-narrative-adapter") -- see module docstring.
-    checkpoint_kind : None (default) loads the final/full-run adapter;
-                  "train-best" or "eval-best" loads the best-so-far
-                  checkpoint of that kind instead -- registered live during
-                  training by utils.save_model.BestCheckpointS3WandbCallback.
-                  Useful for a run that's still in progress or was
-                  interrupted before finishing.
-    wandb_version : the W&B artifact's version alias -- "latest" (default)
-                  or a specific pinned version like "v61", to reproduce /
-                  test an exact checkpoint rather than whatever is newest.
-                  NOT the same thing as `version` below (that's the prompt
-                  scheme; this is the W&B artifact version tag).
-    version     : which NARRATIVE_VERSIONS entry (utils/prompts.py) the
-                  loaded adapter was actually trained on -- selects the
-                  system/user prompt and label set predict()/apredict() use.
-                  Default "v1": the only version an adapter has been trained
-                  on so far. MUST match the adapter you're loading; passing
-                  "v2" while loading a v1-trained adapter (or vice versa)
-                  reintroduces a train/inference prompt mismatch. Check the
-                  W&B artifact's own metadata["version"] if unsure -- e.g.
-                  qwen-narrative-adapter-train-best:v61's metadata records
-                  "version": "v2".
-    shared_model, shared_tokenizer, adapter_name : for sharing ONE loaded
-                  Qwen base across multiple fine-tuned heads (see
-                  prediction/predict_main.py) instead of each wrapper class
-                  loading its own full copy of the 7B base model. Leave both
-                  shared_model/shared_tokenizer as None (default) to load a
-                  standalone base, exactly as before. To share: pass the
-                  OTHER wrapper's already-loaded `.model` (a PeftModel) as
-                  shared_model (and, to skip a redundant tokenizer load, its
-                  `.tokenizer` as shared_tokenizer) -- this adapter is then
-                  attached to that SAME PeftModel under `adapter_name`
-                  (PEFT's multi-adapter support) rather than a second base
-                  being loaded. adapter_name defaults to "narrative"; predict()/
-                  apredict() call self.model.set_adapter(adapter_name) before
-                  every generate() call, so the right adapter is active even
-                  if a sibling wrapper sharing the same model switched it in
-                  between.
+    Args:
+        local_dir: Adapter download dir (must not be shared with other adapters).
+        wandb_project: W&B project; defaults to WANDB_PROJECT.
+        artifact_name: W&B artifact name; defaults to
+            WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME.
+        checkpoint_kind: None for the final adapter, or "train-best"/"eval-best".
+        wandb_version: W&B artifact version ("latest" or e.g. "v61").
+        version: NARRATIVE_VERSIONS key the adapter was trained on.
+        base_model_id, load_in_4bit, dtype, device_map: Base model loading options.
+        shared_model, shared_tokenizer: An already-loaded PeftModel/tokenizer to
+            attach this adapter to instead of loading a new base.
+        adapter_name: PEFT adapter name.
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
@@ -179,9 +97,6 @@ class NarrativeModel:
         )
 
         if shared_model is not None:
-            # Attach this adapter to an ALREADY-LOADED base/PeftModel instead
-            # of loading a second copy of the 7B base -- see shared_model's
-            # docstring above.
             shared_model.load_adapter(str(adapter_dir), adapter_name=adapter_name)
             self.model = shared_model
         else:
@@ -203,8 +118,7 @@ class NarrativeModel:
         if shared_tokenizer is not None:
             self.tokenizer = shared_tokenizer
         else:
-            # Adapter uploads contain weights/configuration only. Fall back to the
-            # base model tokenizer when tokenizer files were not uploaded with them.
+            # Fall back to the base model tokenizer if the adapter has none.
             tokenizer_dir = adapter_dir if any(adapter_dir.glob("tokenizer*")) else base_model_id
             self.tokenizer = AutoTokenizer.from_pretrained(
                 str(tokenizer_dir),
@@ -212,15 +126,11 @@ class NarrativeModel:
             )
 
     def predict(self, abstract, max_new_tokens=400):
-        """Predict this instance's version-selected labels for one abstract,
-        using the exact prompt training data was built with. Returns a dict
-        with all labels always present (empty string for anything the model
-        didn't produce / that failed to parse).
+        """Extract the narrative of one abstract.
 
-        max_new_tokens default: v2's 5-field assistant JSON measured up to
-        269 tokens on a 20-abstract sample (see synthetic_narrative_labelling
-        _dataset_building.py dry runs); 400 keeps >20% headroom above that.
-        Re-check this at full-dataset scale before relying on it for v2."""
+        Returns:
+            dict: All labels present; "" for any missing or unparsable value.
+        """
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": self.user_template.format(abstract=abstract)},
@@ -250,18 +160,13 @@ class NarrativeModel:
         return _normalize_narrative(obj, self.labels)
 
     async def apredict(self, items, batch_size=8, max_new_tokens=400):
-        """Async batched version of predict(). Like FineTunedNERModel.apredict
-        (predict_ner_v2.py), this does REAL batched generation: items are
-        grouped into chunks of `batch_size`, each chunk tokenized together
-        and generated in ONE model.generate() call, so the chunk shares the
-        GPU's memory-bandwidth-bound weight reads instead of each item
-        paying that cost separately. Each chunk's blocking generate() call
-        runs via asyncio.to_thread so it doesn't block the event loop;
-        chunks are processed one at a time (GPU is one device).
+        """Batched predict() over many abstracts.
 
-        items : list of {"id": ..., "abstract": ...}.
-        Returns a list, one entry per input item (same order), of
-        {"id": ..., "narrative": {TASK, LIMITATION, CONTRIBUTION}}.
+        Args:
+            items: List of {"id", "abstract"} dicts.
+
+        Returns:
+            list[dict]: {"id", "narrative"} per item, in input order.
         """
         results = []
         with tqdm(total=len(items), desc="Extracting narratives", unit="abstract") as pbar:
@@ -272,9 +177,7 @@ class NarrativeModel:
         return results
 
     def _generate_batch(self, chunk, max_new_tokens):
-        """Tokenize `chunk` (list of {id, abstract}) as one left-padded batch
-        and run a single generate() call over it, then parse each
-        sequence's completion independently."""
+        """Run one left-padded generate() call over a chunk of {id, abstract}."""
         ids = [it["id"] for it in chunk]
         abstracts = [it["abstract"] for it in chunk]
 
@@ -289,10 +192,7 @@ class NarrativeModel:
             for abstract in abstracts
         ]
 
-        # Decoder-only batched generation needs LEFT padding: it right-aligns
-        # every prompt's real content so all sequences' generated tokens
-        # start at the same index (prompt_len below), regardless of each
-        # prompt's original length.
+        # Decoder-only batched generation needs left padding.
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
@@ -344,7 +244,7 @@ if __name__ == "__main__":
         local_dir=local_dir,
         checkpoint_kind="train-best",
         wandb_version="latest",
-        version="v2",          # must match whatever :latest actually is -- check its metadata["version"] if unsure
+        version="v2",          # must match the adapter's metadata["version"]
     )
 
     sample_abstract = """We present the Compressive Transformer, an attentive sequence model which\ncompresses past memories for long-range sequence learning. We find the\nCompressive Transformer obtains state-of-the-art language modelling results in\nthe WikiText-103 and Enwik8 benchmarks, achieving 17.1 ppl and 0.97 bpc\nrespectively. We also find it can model high-frequency speech effectively and\ncan be used as a memory mechanism for RL, demonstrated on an object matching\ntask. To promote the domain of long-range sequence learning, we propose a new\nopen-vocabulary language modelling benchmark derived from books, PG-19."""

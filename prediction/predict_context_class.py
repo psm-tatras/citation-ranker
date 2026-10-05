@@ -1,48 +1,12 @@
 """
-Inference for the QLoRA-fine-tuned citation-relation-classification model
-(training/train_qlora_context_classifier.py): given a citation context
-(main paper M, cited paper R, the sentence where R is cited), predict
-FUNCTION/M_ASPECT/POLARITY/EVIDENCE/R_MATCH using the EXACT same prompt the
-model was trained on, so inference matches training.
+Inference for the QLoRA-fine-tuned citation-relation classifier.
 
-Unlike prediction/predict_narrative.py (which resolves its prompt against a
-local utils.prompts.NARRATIVE_VERSIONS registry by a caller-supplied
-`version` string), the prompt here is loaded DIRECTLY FROM the W&B model
-artifact's own metadata -- train_qlora_context_classifier.py embeds the full
-CITATION_CLASSIFIER_SLM_VERSIONS[version] config (system prompt, user
-template, narrative block, label sets) in metadata["prompt"] when it
-registers the adapter (both the final artifact and every live
-train-best/eval-best checkpoint). So there is no `version` parameter to get
-wrong here: whichever adapter gets loaded, its own prompt comes along with
-it, and train/inference can never silently disagree the way
-predict_narrative.py's module docstring warns about for NARRATIVE_VERSIONS.
+Predicts FUNCTION/M_ASPECT/POLARITY/EVIDENCE/R_MATCH for one citation
+context. The prompt is read from the W&B artifact's metadata["prompt"], so it
+always matches the loaded adapter.
 
-Mirrors prediction/predict_ner_v2.py's FineTunedNERModel /
-prediction/predict_narrative.py's NarrativeModel: resolves and downloads the
-latest adapter via its W&B model artifact (utils.load_model.load_latest_adapter),
-loads the frozen Qwen base with the adapter on top, and offers both a
-single-context predict() and a real batched-generation apredict() for many
-citation contexts at once.
-
-The context-classifier adapter is registered under its OWN W&B artifact name
-(train_qlora_context_classifier.py's WANDB_ADAPTER_ARTIFACT_NAME, sourced
-from the WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME env var, default
-"qwen-context-classifier-adapter") -- separate from the NER and narrative
-adapters -- so ContextClassifierModel resolves "latest" against that name by
-default, NOT utils.load_model's NER-flavored WANDB_ADAPTER_ARTIFACT_NAME
-constant (do not import/use that one here). Required env vars to load
-successfully:
-  WANDB_PROJECT                                  -- must match the project
-                                                     the adapter was
-                                                     registered in
-  WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME -- optional; defaults to
-                                                     "qwen-context-classifier-adapter"
-                                                     (matches
-                                                     train_qlora_context_classifier.py's
-                                                     default)
-  AWS creds (AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, or an IAM role) +
-  AWS_REGION -- to download the adapter files from S3; the bucket/key prefix
-                themselves come from the artifact's own metadata, not env vars
+Env vars: WANDB_PROJECT, WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME
+(default "qwen-context-classifier-adapter"), AWS credentials + AWS_REGION.
 """
 
 import asyncio
@@ -64,8 +28,7 @@ from training.train_data_generator.synthetic_context_classification_dataset_buil
 
 
 def _normalize_prediction(obj, output_keys):
-    """Ensure every key in `output_keys` is present as a string, so callers
-    get a predictable shape regardless of what the model actually returned."""
+    """Return a dict with every output key present as a string."""
     if not isinstance(obj, dict):
         obj = {}
     return {key: (obj[key] if isinstance(obj.get(key), str) else "")
@@ -73,18 +36,11 @@ def _normalize_prediction(obj, output_keys):
 
 
 def _regex_extract_labels(raw, output_keys):
-    """Last-resort fallback for when extract_json can't parse the raw
-    completion at all -- mirrors predict_narrative.py's _regex_extract_labels
-    (generic over any ordered list of JSON string keys, so duplicated here
-    rather than imported to avoid coupling this module to predict_narrative's
-    internals). See that module for why a stray unescaped quote inside a
-    value defeats strict brace/quote-balanced JSON parsing and this is
-    needed: anchors each key's value on the START of the next key rather
-    than a closing quote, so a stray quote in the middle of a value doesn't
-    truncate it.
+    """Fallback parser for completions that are not valid JSON.
 
-    Returns {} if none of output_keys could be found at all (raw is too
-    garbled to be worth trusting)."""
+    Each value spans from its key to the next key, so a stray unescaped quote
+    inside a value does not truncate it. Returns {} if no key is found.
+    """
     result = {}
     for i, key in enumerate(output_keys):
         m = re.search(rf'"{re.escape(key)}"\s*:\s*"?', raw)
@@ -98,25 +54,18 @@ def _regex_extract_labels(raw, output_keys):
                 end = start + nm.start()
                 break
         value = raw[start:end].rstrip()
-        value = re.sub(r'[",}\s]+$', '', value)  # trailing quote/comma/brace left from the value's own punctuation
+        value = re.sub(r'[",}\s]+$', '', value)  # trailing quote/comma/brace
         value = value.replace('\\"', '"').replace("\\\\", "\\")
         result[key] = value
     return result
 
 
 def _render_user_message(context, narrative_block_template, user_template, max_side_words):
-    """Preprocess a raw citation-context dict the SAME way
-    synthetic_context_classification_dataset_building.py's build_records()
-    does (collapse_ws/clean_section/clean_narrative/build_context_strings),
-    then render it against the adapter's own prompt templates.
+    """Preprocess a raw citation context as in training and render the user prompt.
 
-    context: {m_title, m_narrative, r_title, r_narrative, section, co_cited,
-              before, center, after} -- m_narrative/r_narrative are RAW
-              narrative dicts (missing/empty fields allowed, as in
-              find_citation_context() output); before/after are lists of RAW
-              sentences; center is the RAW citing sentence; co_cited is a
-              bool or "yes"/"no" string; section is the RAW section heading
-              (may contain {{cite:...}}-style markers).
+    Args:
+        context: {m_title, m_narrative, r_title, r_narrative, section, co_cited,
+            before, center, after} with raw (uncleaned) values.
     """
     m_title = collapse_ws(context.get("m_title", ""))
     r_title = collapse_ws(context.get("r_title", ""))
@@ -140,63 +89,20 @@ def _render_user_message(context, narrative_block_template, user_template, max_s
 
 
 class ContextClassifierModel:
-    """QLoRA fine-tuned citation-relation-classification model: resolves the
-    latest trained adapter via its W&B model artifact and downloads it (the
-    same utils.load_model.load_latest_adapter helper
-    train_qlora_context_classifier.py uses to resume training) into
-    local_dir, then loads the frozen base from HF with the adapter on top.
+    """Citation-relation classifier: Qwen base with the classifier LoRA adapter.
 
-    The prompt (system/template/narrative_block/output_keys) is read from
-    THAT SAME ARTIFACT's metadata["prompt"] -- not from a locally-chosen
-    utils.prompts.CITATION_CLASSIFIER_SLM_VERSIONS version -- so whichever
-    adapter gets loaded, its exact training prompt comes with it.
-
-    The base loads in 4-bit by default so it fits a 12 GB GPU, matching how
-    it was trained. The tokenizer is loaded from the adapter dir, so the
-    exact chat template it was trained with is used.
-
-    local_dir   : where the adapter is downloaded to / then loaded from.
-                  Use a directory distinct from the NER/narrative adapters'
-                  (e.g. NOT NER_MODEL_LOCAL_DIR / NARRATIVE_MODEL_LOCAL_DIR)
-                  -- both land at <local_dir>/adapter_model, so sharing a dir
-                  with another model would overwrite one with the other.
-    wandb_project, artifact_name : W&B project / model artifact name to
-                  resolve "latest" from; default to WANDB_PROJECT (env) and
-                  WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME (env,
-                  default "qwen-context-classifier-adapter") -- see module
-                  docstring.
-    checkpoint_kind : None (default) loads the final/full-run adapter;
-                  "train-best" or "eval-best" loads the best-so-far
-                  checkpoint of that kind instead -- registered live during
-                  training by utils.save_model.BestCheckpointS3WandbCallback.
-                  Useful for a run that's still in progress or was
-                  interrupted before finishing.
-    wandb_version : the W&B artifact's version alias -- "latest" (default)
-                  or a specific pinned version like "v61", to reproduce /
-                  test an exact checkpoint rather than whatever is newest.
-    max_side_words : must match whatever --max_side_words the adapter's
-                  training dataset was actually built with (default 40,
-                  matching synthetic_context_classification_dataset_building.py's
-                  CLI default) -- a mismatch here doesn't break JSON parsing,
-                  but silently shows the model more or less citation context
-                  per side than it saw in training.
-    shared_model, shared_tokenizer, adapter_name : for sharing ONE loaded
-                  Qwen base across multiple fine-tuned heads (see
-                  prediction/predict_main.py) instead of each wrapper class
-                  loading its own full copy of the 7B base model. Leave both
-                  shared_model/shared_tokenizer as None (default) to load a
-                  standalone base, exactly as before. To share: pass the
-                  OTHER wrapper's already-loaded `.model` (a PeftModel) as
-                  shared_model (and, to skip a redundant tokenizer load, its
-                  `.tokenizer` as shared_tokenizer) -- this adapter is then
-                  attached to that SAME PeftModel under `adapter_name`
-                  (PEFT's multi-adapter support) rather than a second base
-                  being loaded. adapter_name defaults to "context_classifier";
-                  predict()/apredict() call
-                  self.model.set_adapter(adapter_name) before every
-                  generate() call, so the right adapter is active even if a
-                  sibling wrapper sharing the same model switched it in
-                  between.
+    Args:
+        local_dir: Adapter download dir (must not be shared with other adapters).
+        wandb_project: W&B project; defaults to WANDB_PROJECT.
+        artifact_name: W&B artifact name; defaults to
+            WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME.
+        checkpoint_kind: None for the final adapter, or "train-best"/"eval-best".
+        wandb_version: W&B artifact version ("latest" or e.g. "v61").
+        max_side_words: Must match the training dataset's --max_side_words.
+        base_model_id, load_in_4bit, dtype, device_map: Base model loading options.
+        shared_model, shared_tokenizer: An already-loaded PeftModel/tokenizer to
+            attach this adapter to instead of loading a new base.
+        adapter_name: PEFT adapter name.
     """
 
     def __init__(self, local_dir, wandb_project=None, artifact_name=None,
@@ -214,9 +120,6 @@ class ContextClassifierModel:
         self.max_side_words = max_side_words
         self.adapter_name = adapter_name
 
-        # Load the prompt from the artifact's OWN metadata (embedded by
-        # train_qlora_context_classifier.py) rather than resolving a version
-        # against utils.prompts locally -- see class docstring.
         artifact = resolve_latest_adapter_artifact(
             wandb_project=resolved_project,
             artifact_name=resolved_artifact_name,
@@ -248,9 +151,6 @@ class ContextClassifierModel:
         )
 
         if shared_model is not None:
-            # Attach this adapter to an ALREADY-LOADED base/PeftModel instead
-            # of loading a second copy of the 7B base -- see shared_model's
-            # docstring above.
             shared_model.load_adapter(str(adapter_dir), adapter_name=adapter_name)
             self.model = shared_model
         else:
@@ -272,8 +172,7 @@ class ContextClassifierModel:
         if shared_tokenizer is not None:
             self.tokenizer = shared_tokenizer
         else:
-            # Adapter uploads contain weights/configuration only. Fall back to the
-            # base model tokenizer when tokenizer files were not uploaded with them.
+            # Fall back to the base model tokenizer if the adapter has none.
             tokenizer_dir = adapter_dir if any(adapter_dir.glob("tokenizer*")) else base_model_id
             self.tokenizer = AutoTokenizer.from_pretrained(
                 str(tokenizer_dir),
@@ -281,19 +180,10 @@ class ContextClassifierModel:
             )
 
     def predict(self, context, max_new_tokens=200):
-        """Predict FUNCTION/M_ASPECT/POLARITY/EVIDENCE/R_MATCH for one
-        citation context, using the exact prompt the loaded adapter was
-        trained with. Returns a dict with all output_keys always present
-        (empty string for anything the model didn't produce / that failed
-        to parse).
+        """Classify one citation context (see _render_user_message for its shape).
 
-        context: see _render_user_message's docstring for the expected shape.
-
-        max_new_tokens default: 200 is a conservative estimate for this
-        5-field JSON (EVIDENCE capped at 12 words); unlike
-        NarrativeModel.predict's 400 (measured on a real sample), this has
-        not yet been benchmarked against actual generations -- re-check once
-        this adapter has been run on a real batch and lower/raise as needed.
+        Returns:
+            dict: All output keys present; "" for any missing or unparsable value.
         """
         messages = [
             {"role": "system", "content": self.system_prompt},
@@ -325,20 +215,13 @@ class ContextClassifierModel:
         return _normalize_prediction(obj, self.output_keys)
 
     async def apredict(self, items, batch_size=8, max_new_tokens=200):
-        """Async batched version of predict(). Like FineTunedNERModel.apredict
-        (predict_ner_v2.py) / NarrativeModel.apredict (predict_narrative.py),
-        this does REAL batched generation: items are grouped into chunks of
-        `batch_size`, each chunk tokenized together and generated in ONE
-        model.generate() call, so the chunk shares the GPU's
-        memory-bandwidth-bound weight reads instead of each item paying that
-        cost separately. Each chunk's blocking generate() call runs via
-        asyncio.to_thread so it doesn't block the event loop; chunks are
-        processed one at a time (GPU is one device).
+        """Batched predict() over many citation contexts.
 
-        items : list of {"id": ..., "context": <citation-context dict, see
-                _render_user_message>}.
-        Returns a list, one entry per input item (same order), of
-        {"id": ..., "prediction": {FUNCTION, M_ASPECT, POLARITY, EVIDENCE, R_MATCH}}.
+        Args:
+            items: List of {"id", "context"} dicts.
+
+        Returns:
+            list[dict]: {"id", "prediction"} per item, in input order.
         """
         results = []
         with tqdm(total=len(items), desc="Classifying citation relations", unit="context") as pbar:
@@ -349,9 +232,7 @@ class ContextClassifierModel:
         return results
 
     def _generate_batch(self, chunk, max_new_tokens):
-        """Tokenize `chunk` (list of {id, context}) as one left-padded batch
-        and run a single generate() call over it, then parse each
-        sequence's completion independently."""
+        """Run one left-padded generate() call over a chunk of {id, context}."""
         ids = [it["id"] for it in chunk]
         contexts = [it["context"] for it in chunk]
 
@@ -367,10 +248,7 @@ class ContextClassifierModel:
             for context in contexts
         ]
 
-        # Decoder-only batched generation needs LEFT padding: it right-aligns
-        # every prompt's real content so all sequences' generated tokens
-        # start at the same index (prompt_len below), regardless of each
-        # prompt's original length.
+        # Decoder-only batched generation needs left padding.
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:

@@ -87,22 +87,11 @@ def chat(tok, model, system, user, max_new_tokens=512, temperature=0.0):
 
 # ---- parsing / offset resolution (mirrors your build_ner_dataset pipeline) ----
 def _sanitize_json_escapes(s):
-    """SLMs copying LaTeX verbatim (\\tilde, \\Lambda, $...$) emit invalid JSON
-    escapes that make json.loads fail -> empty output. Escape any backslash not
-    starting a valid JSON escape, and neutralize raw control chars, so the
-    object parses. Math-heavy surface strings may then not match the abstract
-    verbatim and get dropped by resolve_offsets -- acceptable; the clean spans
-    in the same record survive instead of losing the whole record.
+    """Escape stray backslashes (e.g. LaTeX) and control chars so json.loads succeeds.
 
-    Scans left-to-right and consumes an already-valid escape (\\", \\\\, \\/,
-    \\b, \\f, \\n, \\r, \\t, \\uXXXX) as one atomic unit rather than matching
-    each backslash independently -- a regex like r'\\\\(?!["\\\\/bfnrtu])'
-    mis-handles a run of backslashes: on an already-valid "\\\\" (escaped
-    backslash) it leaves the first backslash alone (next char looks like a
-    valid escape start) but then re-examines the SECOND backslash on its own
-    and "fixes" it too, turning a valid 2-backslash sequence into an invalid
-    3-backslash one -- which is exactly the kind of mixed \\lesssim (invalid)
-    / \\\\lambda (already-valid) output real completions produce side by side."""
+    Valid escapes are consumed as whole units, so already-escaped sequences
+    are left unchanged.
+    """
     out = []
     i, n = 0, len(s)
     while i < n:
@@ -124,6 +113,7 @@ def _sanitize_json_escapes(s):
 
 
 def extract_json(raw):
+    """Parse the first JSON object in a model completion (code fences allowed)."""
     raw = raw.strip()
     m = re.search(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL)
     if m:
@@ -132,7 +122,7 @@ def extract_json(raw):
     if s == -1:
         raise ValueError("no JSON object")
     frag = raw[s:]
-    # attempt 1: strict first-balanced-object parse (string-aware)
+    # attempt 1: first balanced object (string-aware)
     for candidate in (frag, _sanitize_json_escapes(frag)):
         try:
             depth = 0
@@ -156,10 +146,7 @@ def extract_json(raw):
                         return json.loads(candidate[:i + 1])
         except Exception:
             continue
-    # attempt 2: REPAIR. SLMs (Qwen incl.) sometimes close the entities array
-    # early and keep appending objects: {"entities":[{..}], {..}, {..}}.
-    # Harvest every well-formed {text,label} object directly. Run on the
-    # sanitized fragment so LaTeX backslashes don't break the inner json.loads.
+    # attempt 2: harvest {text,label} objects from a malformed entities array
     objs = re.findall(
         r'\{\s*"text"\s*:\s*"(?:[^"\\]|\\.)*"\s*,\s*"label"\s*:\s*"[A-Z_]+"\s*\}',
         _sanitize_json_escapes(frag))

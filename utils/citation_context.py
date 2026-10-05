@@ -4,6 +4,8 @@ import re
 from utils.seku_crd_corpus_utils import *
 
 class CitationContextExtractor:
+    """Find the sentences citing a given arXiv paper, with surrounding context."""
+
     MARKER = r"\{\{(?:cite|figure|table):[^}]*\}\}"
     # a marker optionally followed by more ", marker" / " marker" (grouped citations)
     MARKER_GROUP_RE = re.compile(r"\s*" + MARKER + r"(?:\s*[,;]?\s*" + MARKER + r")*")
@@ -17,10 +19,7 @@ class CitationContextExtractor:
         "al", "e.g", "i.e", "cf", "vs", "etc", "approx", "resp", "ch", "vol", "pp", "dr", "prof",
     }
     ARXIV_DOI_PREFIX = "10.48550/arxiv."
-    # unarXive's structured ids/doi/contained_arXiv_ids are frequently empty
-    # even when the raw citation text plainly states "arXiv:XXXX.XXXXX" (or
-    # the pre-2007 "subject-class/YYMMNNN" form) -- this is a fallback to
-    # pull the id straight out of bib_entry_raw when that happens.
+    # fallback: arXiv id stated in the raw bib text when structured ids are empty
     ARXIV_ID_IN_TEXT_RE = re.compile(
         r"arxiv:\s*([a-z.\-]+/\d{7}|\d{4}\.\d{4,5})", re.IGNORECASE)
 
@@ -104,11 +103,7 @@ class CitationContextExtractor:
             if ids.get("arxiv_id"):
                 candidates.add(ids["arxiv_id"])
             for c in bib.get("contained_arXiv_ids") or []:
-                # unarXive sometimes stores these as {"id","text","start","end"}
-                # span dicts instead of plain id strings -- dicts aren't
-                # hashable, so set.update() on the raw list would crash here
-                # (for EVERY caller, since this loop runs over all bib_entries
-                # regardless of which reference is being looked up).
+                # entries may be span dicts instead of id strings
                 if isinstance(c, dict):
                     c = c.get("id")
                 if c:
@@ -192,37 +187,21 @@ class CitationContextExtractor:
         return min(positions, key=lambda p: abs(p - hint)) if positions else -1
 
 def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_context_extractor:CitationContextExtractor,output_dir:str=None,max_refs:int=32):
-    """Find and save citation contexts for a main paper's in-corpus references.
-
-    Looks up main_paper_id in bulk_paper_index for its in_corpus_references,
-    fetches the main paper's full text from S3, then runs
-    citation_context_extractor.extract() against each reference id (capped
-    at max_refs, or all of them if max_refs == -1). References with no
-    located citation context are skipped. The result --
-    {main_paper_id: {ref_paper_id: [contexts, ...], ...}} -- is written to
-    output_dir/<main_paper_id>.json.
+    """Collect citation contexts for a main paper's in-corpus references.
 
     Args:
-        main_paper_id: corpus id of the main paper to process.
-        bulk_paper_index: {paper_id: paper_index_record} mapping (as returned
-            by utils.seku_crd_corpus_utils.load_paper_index), used to look up
-            main_paper_id's in_corpus_references.
-        citation_context_extractor: a CitationContextExtractor instance used
-            to locate each reference's citing sentence(s) in the main paper's
-            text.
-        output_dir: directory the result JSON is written into.
-        max_refs: max number of in-corpus references to process; -1 processes
-            all of them.
+        main_paper_id: Corpus id of the main paper.
+        bulk_paper_index: {paper_id: record} from load_paper_index.
+        citation_context_extractor: CitationContextExtractor instance.
+        output_dir: If set, the result is also written to <output_dir>/<main_paper_id>.json.
+        max_refs: Max references to process; -1 for all.
 
     Returns:
-        True if the result was collected and written successfully, False if
-        any exception was raised (also printed) along the way.
+        (status, {main_paper_id: {"references": {...}, "abstract": ...}})
 
     Note:
-        The main paper's text is dumped to a fixed local filename
-        ("temp_paper_text.json" in the current working directory) before
-        extraction -- concurrent calls (e.g. from multiple processes/threads)
-        would clobber each other's temp file.
+        Writes the main paper to ./temp_paper_text.json, so concurrent calls
+        are not safe.
     """
     status = False
     final_dict = {}
@@ -242,10 +221,7 @@ def find_citation_context(main_paper_id:str,bulk_paper_index:dict,citation_conte
         # but may be, not all references
         if max_refs != -1:
             in_corpus_refs_ids = in_corpus_refs_ids[:min(len(in_corpus_refs_ids),max_refs)]
-        # main loop for each ref papers -- caught PER reference, not around
-        # the whole loop: one bad reference (or a data-format quirk in the
-        # main paper's OWN bib_entries, which extract() re-scans on every
-        # call) must not silently drop every other reference for this paper.
+        # errors are caught per reference so one bad reference doesn't drop the rest
         successfull = 0
         for ref_paper_id in in_corpus_refs_ids:
             try:

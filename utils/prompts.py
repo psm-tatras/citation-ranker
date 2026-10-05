@@ -809,12 +809,8 @@ CONTRIBUTION_TYPES = (
 )
 
 # ============================================================================
-# Narrative Extraction Prompts (3-label: TASK, LIMITATION, CONTRIBUTION)
+# NARRATIVE EXTRACTION v1 (3 labels): TASK, LIMITATION, CONTRIBUTION
 # ============================================================================
-# Version: v1 (2025-09-17)
-# Purpose: Generative extraction of research narrative components from abstracts
-# Labels: TASK (research area/domain), LIMITATION (gap/challenge), CONTRIBUTION (novel thing)
-# Output: Structured JSON with extracted text (no spans/offsets; text only)
 
 NARRATIVE_SYSTEM_v1 = (
     "You are an expert at decomposing research papers into structured narrative components. "
@@ -863,10 +859,6 @@ NARRATIVE_LABELS_v1 = ("TASK", "LIMITATION", "CONTRIBUTION")
 # ============================================================================
 # NARRATIVE EXTRACTION v2 (5 labels): TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT
 # ============================================================================
-# Purpose: v1 + METHOD and RESULT, needed for M-R relation functions (USES/COMPARES)
-# Field roles: CONTRIBUTION = what is new; METHOD = how it is done (incl. existing
-#              data/tools/techniques used); RESULT = what was found or measured
-# Missing fields: "" (empty string) when the abstract does not state them
 
 NARRATIVE_SYSTEM_v2 = (
     "You are an expert at decomposing research papers into structured narrative components. "
@@ -921,14 +913,7 @@ ABSTRACT:
 
 NARRATIVE_LABELS_v2 = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
 
-# ============================================================================
-# NARRATIVE VERSION REGISTRY -- single source of truth for which
-# system/user/labels go together, so data generation
-# (training/train_data_generator/synthetic_narrative_labelling_dataset_building.py)
-# and inference (prediction/predict_narrative.py) can never drift apart by
-# each hardcoding a different v* constant. Both import NARRATIVE_VERSIONS
-# from here rather than importing NARRATIVE_SYSTEM_v1/v2 etc. directly.
-# ============================================================================
+# Narrative version registry, shared by data generation and inference.
 NARRATIVE_VERSIONS = {
     "v1": {
         "system": NARRATIVE_SYSTEM_v1,
@@ -942,10 +927,6 @@ NARRATIVE_VERSIONS = {
         "template": NARRATIVE_USER_TEMPLATE_v2,
         "labels": NARRATIVE_LABELS_v2,
         "description": "5-label narrative extraction: TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT",
-        # Only TASK and CONTRIBUTION are guaranteed stated in an abstract.
-        # The v2 prompt explicitly tells the model to leave a component ""
-        # when the abstract doesn't state it (and calls out METHOD/RESULT by
-        # name for review/survey/software papers).
         "optional": {"LIMITATION", "METHOD", "RESULT"},
     },
 }

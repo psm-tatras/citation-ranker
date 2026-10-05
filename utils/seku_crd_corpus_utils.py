@@ -1,3 +1,5 @@
+"""Paper-index loading and S3 access for the SEKU-CRD corpus."""
+
 import json
 import sys
 import os
@@ -24,7 +26,7 @@ PAPER_INDEX_FILE = "/Work/IISER/citation-data/SEKU-CRD-v1/paper_index_2024.jsonl
 
 
 def _deep_size(obj, seen=None):
-    """Recursively sum sys.getsizeof over obj and its contents (dict/list/tuple/set), so nested container overhead is counted, not just the outer shell. Shared sub-objects are counted once."""
+    """Recursive sys.getsizeof over nested containers; shared objects counted once."""
     if seen is None:
         seen = set()
     obj_id = id(obj)
@@ -44,7 +46,7 @@ def _deep_size(obj, seen=None):
 
 
 def load_paper_index(paper_index_file=PAPER_INDEX_FILE,max_files=-1):
-    """Load paper_index_file into a dict keyed by paper_id, and print its deep in-memory size (recursively sums sys.getsizeof over every nested value, not just the outer dict shell)."""
+    """Load the paper index JSONL into {paper_id: record}; max_files=-1 loads all."""
     paper_index = {}
     if max_files == -1:
         max_files = 200000 # large number, covers all files
@@ -71,11 +73,7 @@ def list_s3_paper_ids(
     region=AWS_REGION,
     s3_client=None,
 ):
-    """
-    List paper_ids already uploaded to s3://bucket_name/directory, by paginating
-    the full listing and stripping the directory prefix + '.json' suffix off
-    each key. Used by build_s3_index to skip files that already exist in S3.
-    """
+    """Return the set of paper_ids stored under s3://bucket_name/directory."""
     if s3_client is None:
         s3_client = boto3.client(
             's3',
@@ -109,15 +107,7 @@ def list_s3_paper_ids(
 
 
 def get_title_and_abstract(paper):
-    """
-    Extract (title, abstract) from a paper record as returned by
-    get_paper_from_s3 / get_papers_from_s3.
-
-    Title comes from metadata.title. Abstract is preferred from the top-level
-    'abstract' field (a {'section': 'Abstract', 'text': ...} dict in this
-    corpus's schema), falling back to metadata.abstract (raw arXiv string)
-    if that's missing. Returns (None, None) if paper is None (not found/failed).
-    """
+    """Return (title, abstract) for a paper record, or (None, None) if paper is None."""
     if paper is None:
         return None, None
 
@@ -149,11 +139,7 @@ def get_paper_from_s3(
     region=AWS_REGION,
     s3_client=None,
 ):
-    """
-    Fetch and parse one paper's JSON content from S3 (paper_id is the filename,
-    without the .json extension). Returns the parsed dict, or None if the key
-    doesn't exist in the bucket.
-    """
+    """Fetch one paper's JSON from S3; returns None if it doesn't exist."""
     if s3_client is None:
         s3_client = boto3.client(
             's3',
@@ -183,22 +169,14 @@ async def get_papers_from_s3(
     region=AWS_REGION,
     num_workers=8,
 ):
-    """
-    Fetch multiple papers' JSON content from S3 concurrently.
-
-    boto3's low-level client is thread-safe, so a single shared client is used
-    across all fetches; each fetch runs get_paper_from_s3() in a worker thread
-    (asyncio.to_thread) under a semaphore capping concurrency at num_workers.
+    """Fetch several papers from S3 concurrently.
 
     Args:
-        paper_ids: Iterable of paper_ids to fetch (S3 filenames, no extension)
-        num_workers: Max concurrent S3 GET requests in flight
+        paper_ids: Paper ids to fetch.
+        num_workers: Max concurrent requests.
 
     Returns:
-        dict mapping paper_id -> parsed JSON dict, or None for any paper_id
-        not found in S3 (NoSuchKey/404). Connection/auth/other errors are NOT
-        swallowed -- they raise out of this call so a broken S3 connection
-        surfaces immediately instead of silently coming back as all-None.
+        {paper_id: paper dict, or None if not found}. Other S3 errors raise.
     """
     s3_config = Config(max_pool_connections=num_workers, retries={'max_attempts': 3})
     s3_client = boto3.client(
@@ -213,10 +191,6 @@ async def get_papers_from_s3(
 
     async def fetch_one(paper_id):
         async with semaphore:
-            # get_paper_from_s3 already returns None for a genuine "not
-            # found" (NoSuchKey/404); anything else (bad credentials, no
-            # connection, access denied, ...) raises and is left to
-            # propagate below, rather than being masked as "not found".
             return paper_id, await asyncio.to_thread(
                 get_paper_from_s3,
                 paper_id,
@@ -397,19 +371,7 @@ def count_s3_files(
     secret_key=AWS_SECRET_ACCESS_KEY,
     region=AWS_REGION
 ):
-    """
-    Count JSON files in S3 directory.
-    
-    Args:
-        bucket_name: S3 bucket name
-        directory: Directory inside bucket (prefix)
-        access_key: AWS access key
-        secret_key: AWS secret key
-        region: AWS region
-    
-    Returns:
-        dict with count stats: {total_files, total_size_gb}
-    """
+    """Count JSON files under an S3 directory; returns {total_files, total_size_gb}."""
     s3_client = boto3.client(
         's3',
         aws_access_key_id=access_key,

@@ -1,16 +1,9 @@
 """
-End-to-end citation-relation prediction pipeline: narrative extraction
-(prediction.predict_narrative.NarrativeModel) feeding into citation-relation
-classification (prediction.predict_context_class.ContextClassifierModel),
-sharing ONE loaded Qwen2.5-7B base model with both LoRA adapters attached
-(via PEFT multi-adapter support) instead of loading the base twice.
+End-to-end citation-relation prediction: narrative extraction followed by
+citation-context classification, sharing one Qwen2.5-7B base model between
+both LoRA adapters.
 
-Required env vars (see predict_narrative.py / predict_context_class.py):
-  WANDB_PROJECT, WANDB_NARRATIVE_ADAPTER_ARTIFACT_NAME,
-  WANDB_CONTEXT_CLASSIFIER_ADAPTER_ARTIFACT_NAME, AWS creds + AWS_REGION
-
-Usage
------
+Usage:
     predictor = CitationPipelinePredictor(
         narrative_local_dir="model/narrative",
         context_classifier_local_dir="model/context_classifier",
@@ -26,21 +19,17 @@ from .predict_context_class import ContextClassifierModel
 
 
 class CitationPipelinePredictor:
-    """Loads one Qwen2.5-7B base model with the narrative and
-    context-classifier LoRA adapters both attached to it.
+    """Narrative and context-classifier adapters on a single shared base model.
 
     Args:
-        narrative_local_dir, context_classifier_local_dir: download/load dir
-            for each adapter (must be two different directories).
-        base_model_id, load_in_4bit, dtype, device_map: passed to the single
-            base-model load.
-        narrative_version: NARRATIVE_VERSIONS entry (utils/prompts.py) the
-            narrative adapter was trained on.
-        narrative_wandb_project/artifact_name/checkpoint_kind/wandb_version,
-        context_wandb_project/artifact_name/checkpoint_kind/wandb_version:
-            per-adapter W&B resolution overrides.
-        context_max_side_words: must match the context-classifier adapter's
-            training --max_side_words.
+        narrative_local_dir: Download dir for the narrative adapter.
+        context_classifier_local_dir: Download dir for the context-classifier
+            adapter (must differ from narrative_local_dir).
+        base_model_id, load_in_4bit, dtype, device_map: Base model loading options.
+        narrative_version: NARRATIVE_VERSIONS key the narrative adapter was trained on.
+        narrative_*, context_*: Per-adapter W&B overrides (project, artifact
+            name, checkpoint kind, artifact version).
+        context_max_side_words: Must match the classifier's training --max_side_words.
     """
 
     def __init__(self, narrative_local_dir, context_classifier_local_dir,
@@ -78,9 +67,8 @@ class CitationPipelinePredictor:
         )
 
     def predict_narrative(self, abstract, max_new_tokens=400):
-        """
-        Args:
-            abstract: paper abstract (main or reference paper).
+        """Extract the narrative of one abstract.
+
         Returns:
             dict: {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
         """
@@ -88,21 +76,16 @@ class CitationPipelinePredictor:
 
     def predict_citation_context(self, m_title, m_narrative, r_title, r_narrative,
                                   cite_ctx, relation_max_new_tokens=200):
-        """
+        """Classify each citation context of one reference.
+
         Args:
-            m_title: main paper title.
-            m_narrative: dict from predict_narrative(m_abstract).
-            r_title: cited paper title.
-            r_narrative: dict from predict_narrative(r_abstract).
-            cite_ctx: list of {section, ref_id, sentence_index, before,
-                center, after} dicts for ONE reference -- e.g.
-                find_citation_context(...)[1][m_id]["references"][r_id]["citation_context"].
-                co_cited is not computed here; defaults to False unless an
-                entry supplies its own "co_cited" key.
+            m_title, m_narrative: Main paper title and narrative.
+            r_title, r_narrative: Cited paper title and narrative.
+            cite_ctx: List of {section, ref_id, sentence_index, before, center,
+                after} dicts for one reference; co_cited defaults to False.
+
         Returns:
-            list[dict], one per cite_ctx entry (same order):
-                {section, sentence_index, ref_id,
-                 relation: {FUNCTION, M_ASPECT, POLARITY, EVIDENCE, R_MATCH}}
+            list[dict]: One {section, sentence_index, ref_id, relation} per entry.
         """
         results = []
         for entry in cite_ctx:
