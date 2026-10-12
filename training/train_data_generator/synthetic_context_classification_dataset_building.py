@@ -51,11 +51,18 @@ record-level limit:
         --version v1 \\
         -n 5
 
-Re-parse cached outputs only, optionally with a different SFT template
-(no API calls; --sft_version lets you regenerate train/val with a leaner
-Qwen prompt later without re-paying DeepSeek for the labels themselves):
+Re-parse cached outputs only and render the SFT train/val files with the lean
+Qwen prompt (no API calls). --version must be the LAYER_2 version the cached
+labels were extracted with (input hashes depend on it); --sft_version selects a
+CITATION_CLASSIFIER_SLM_VERSIONS entry (utils/prompts.py):
     python -m training.train_data_generator.synthetic_context_classification_dataset_building \\
-        --input_dir data/citation_contexts --out_dir layer2_data --skip_extract --sft_version v1
+        --input_dir data/citation_contexts --out_dir layer2_data --version v2 \\
+        --skip_extract --sft_version v1 --require_evidence --require_evidence_len
+
+SFT targets contain only the SLM version's output_keys (CONFIDENCE is dropped;
+it is used only for --min_confidence filtering). Train/val files are named
+*_layer2_{train,val}_slm_<sft_version>.jsonl so a rebuild never overwrites
+files rendered with another prompt.
 """
 
 import argparse
@@ -69,7 +76,7 @@ import sys
 import time
 from collections import Counter, defaultdict
 
-from utils.prompts import LAYER_2_VERSIONS
+from utils.prompts import LAYER_2_VERSIONS, CITATION_CLASSIFIER_SLM_VERSIONS
 from dotenv import load_dotenv
 
 from training.train_data_generator.synthetic_narrative_labelling_dataset_building import (
@@ -337,10 +344,13 @@ def validate_label(obj, version_cfg):
 
 def check_evidence(evidence, before, center, after):
     """Whitespace-normalized, case-insensitive substring check of EVIDENCE
-    against the rendered context. Never causes a drop -- callers store the
-    bool result as evidence_verified."""
+    against the rendered context. EVIDENCE containing the [Citation] marker
+    is unverified (the marker is not text of M). Never causes a drop --
+    callers store the bool result as evidence_verified."""
     haystack = collapse_ws(f"{before} {center} {after}").lower()
     needle = collapse_ws(evidence).lower()
+    if "[citation]" in needle:
+        return False
     return bool(needle) and needle in haystack
 
 
@@ -370,9 +380,10 @@ def load_raw_cache(path):
 def build_sft_example(record, label_obj, sft_version_cfg):
     """Build a chat message for Qwen SFT training from a labeled record's
     raw/preprocessed inputs (`record["inputs"]`), re-rendered fresh against
-    `sft_version_cfg` -- so a different --sft_version (e.g. a leaner Qwen
-    prompt registered later) can regenerate train/val without re-querying
-    DeepSeek for the label itself."""
+    `sft_version_cfg` (a CITATION_CLASSIFIER_SLM_VERSIONS entry) -- so the
+    lean Qwen prompt can be rendered without re-querying DeepSeek for the
+    label itself. The assistant target holds only sft_version_cfg's
+    output_keys (CONFIDENCE excluded)."""
     inputs = record["inputs"]
     m_block = render_narrative_block(inputs["m_narrative"], sft_version_cfg["narrative_block"])
     r_block = render_narrative_block(inputs["r_narrative"], sft_version_cfg["narrative_block"])
@@ -382,7 +393,8 @@ def build_sft_example(record, label_obj, sft_version_cfg):
         section=inputs["section"], co_cited=record["co_cited"],
         before=inputs["before"], center=inputs["center"], after=inputs["after"],
     )
-    assistant_content = json.dumps(record["label"], ensure_ascii=False)
+    target = {k: label_obj[k] for k in sft_version_cfg["output_keys"]}
+    assistant_content = json.dumps(target, ensure_ascii=False)
     return {
         "messages": [
             {"role": "system", "content": sft_version_cfg["system"]},
@@ -435,10 +447,10 @@ def main():
                     help="Output directory root for the version-scoped output subdirectory")
     ap.add_argument("--version", choices=sorted(LAYER_2_VERSIONS), default="v1",
                     help="Layer-2 label scheme to extract, from utils/prompts.py. Default: v1")
-    ap.add_argument("--sft_version", default=None,
-                    help="Version to render SFT train/val messages with; defaults to --version. "
-                         "Lets you regenerate SFT files with a different template later via "
-                         "--skip_extract without re-paying DeepSeek for the labels.")
+    ap.add_argument("--sft_version", choices=sorted(CITATION_CLASSIFIER_SLM_VERSIONS), default="v1",
+                    help="CITATION_CLASSIFIER_SLM_VERSIONS entry (utils/prompts.py) to render SFT "
+                         "train/val messages with -- must be the prompt the classifier is trained "
+                         "and run with. Combine with --skip_extract to rebuild without DeepSeek calls.")
     ap.add_argument("--max_side_words", type=int, default=40,
                     help="Max words kept on each side of the citing sentence "
                          "(last N of before, first N of after)")
@@ -464,8 +476,11 @@ def main():
 
     LAYER_2_VERSION = args.version
     VERSION_CFG = LAYER_2_VERSIONS[LAYER_2_VERSION]
-    sft_version = args.sft_version or LAYER_2_VERSION
-    sft_version_cfg = LAYER_2_VERSIONS[sft_version]
+    sft_version = args.sft_version
+    sft_version_cfg = CITATION_CLASSIFIER_SLM_VERSIONS[sft_version]
+    missing_keys = set(sft_version_cfg["output_keys"]) - set(LABEL_KEYS)
+    if missing_keys:
+        raise ValueError(f"SLM {sft_version} output_keys {sorted(missing_keys)} not in LABEL_KEYS {LABEL_KEYS}")
 
     input_dir_stem = os.path.basename(os.path.normpath(args.input_dir))
     out_dir = os.path.join(args.out_dir, f"{input_dir_stem}_layer2_{LAYER_2_VERSION}")
@@ -474,8 +489,8 @@ def main():
 
     raw_path = os.path.join(out_dir, f"{input_dir_stem}_raw_outputs.jsonl")
     labeled_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_labeled.jsonl")
-    train_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_train.jsonl")
-    val_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_val.jsonl")
+    train_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_train_slm_{sft_version}.jsonl")
+    val_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_val_slm_{sft_version}.jsonl")
     labels_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_labels.json")
     summary_path = os.path.join(out_dir, f"{input_dir_stem}_layer2_summary.md")
 
@@ -483,7 +498,8 @@ def main():
     print(f"Model              : {DEEPSEEK_MODEL}")
     print(f"Input dir          : {args.input_dir} (glob={args.glob}, nb_input_json={args.nb_input_json})")
     print(f"Layer-2 version    : {LAYER_2_VERSION} ({VERSION_CFG['description']})")
-    print(f"SFT version        : {sft_version}")
+    print(f"SFT version        : {sft_version} (CITATION_CLASSIFIER_SLM_VERSIONS, "
+          f"targets={list(sft_version_cfg['output_keys'])})")
     print(f"Output dir         : {out_dir}")
 
     print("\nBuilding records from citation contexts...")
@@ -800,12 +816,12 @@ def main():
         }, indent=2),
         "```",
         "",
-        "SFT chat format (`*_layer2_train.jsonl` / `*_layer2_val.jsonl`):",
+        f"SFT chat format (`*_layer2_train_slm_{sft_version}.jsonl` / `*_layer2_val_slm_{sft_version}.jsonl`):",
         "```json",
         '{"messages": [{"role": "system", "content": "..."}, '
         '{"role": "user", "content": "..."}, '
         '{"role": "assistant", "content": "' +
-            json.dumps(json.dumps({k: "..." for k in LABEL_KEYS})).strip('"') + '"}]}',
+            json.dumps(json.dumps({k: "..." for k in sft_version_cfg["output_keys"]})).strip('"') + '"}]}',
         "```",
         "",
         "## Files",

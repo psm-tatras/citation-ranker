@@ -135,6 +135,9 @@ if __name__ == "__main__":
                           "(mutually exclusive with main_paper_id)")
     ap.add_argument("--max-references", type=int, default=32, help="Cap on references processed (-1 for all)")
     ap.add_argument("--max-index-files", type=int, default=4096, help="load_paper_index's max_files cap (-1 for all)")
+    ap.add_argument("--context-checkpoint-kind", choices=["final", "train-best", "eval-best"], default="train-best",
+                     help="Which context-classifier W&B artifact to load: 'final' (default full-run adapter), "
+                          "'train-best', or 'eval-best'")
     ap.add_argument("--save", action="store_true", help="Write result JSON file(s) to --output-dir instead of printing them")
     ap.add_argument("--output-dir", default=str(project_root / "data" / "facet_predictions"))
     args = ap.parse_args()
@@ -157,7 +160,7 @@ if __name__ == "__main__":
         narrative_checkpoint_kind="train-best",
         narrative_wandb_version="latest",
         narrative_version="v2",
-        context_checkpoint_kind="train-best",
+        context_checkpoint_kind=None if args.context_checkpoint_kind == "final" else args.context_checkpoint_kind,
         context_wandb_version="latest",
     )
     citation_ctx_extractor = CitationContextExtractor()

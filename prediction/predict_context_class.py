@@ -325,5 +325,6 @@ if __name__ == "__main__":
         "center": "All our models are trained using Adam [Citation] for 5,000 epochs, where each epoch is over a chunk of 10,000 training samples.",
         "after": ["Since we are generating the data, we vary the training samples from 1k to 1M, and use a validation set of 10k samples."],
     }
-    prediction = context_classifier_model.predict(sample_context)
+    with context_classifier_model.model.disable_adapter():
+        prediction = context_classifier_model.predict(sample_context)
     print(json.dumps(prediction, indent=2))

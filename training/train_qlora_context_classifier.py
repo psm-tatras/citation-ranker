@@ -21,6 +21,13 @@ so the artifact is self-describing: a later inference script can pull the
 adapter and know exactly which prompt to call it with, even if
 utils/prompts.py has moved on to a newer version by then.
 
+Loss is computed on the assistant (label JSON) tokens only, via
+DataCollatorForCompletionOnlyLM. Before training, every train/val example is
+tokenized and the run aborts if any exceeds --max-seq-length (truncation
+previously cut every example before its citation context and target) or lacks
+the "<|im_start|>assistant\n" response template (it would be fully masked and
+contribute no loss).
+
 Memory profile: ~8-11 GB for 7B model with batch size 2-4
 """
 
@@ -68,8 +75,8 @@ WANDB_ADAPTER_ARTIFACT_NAME = os.getenv(
 
 WANDB_DATASET_ARTIFACT = os.getenv("WANDB_DATASET_ARTIFACT", "dataset-context-classification-56main:latest")
 WANDB_DATASET_PROJECT = os.getenv("WANDB_DATASET_PROJECT", "")
-WANDB_ARTIFACT_TRAIN_FILE = os.getenv("WANDB_ARTIFACT_TRAIN_FILE", "citation_contexts_layer2_train.jsonl")
-WANDB_ARTIFACT_VAL_FILE = os.getenv("WANDB_ARTIFACT_VAL_FILE", "citation_contexts_layer2_val.jsonl")
+WANDB_ARTIFACT_TRAIN_FILE = os.getenv("WANDB_ARTIFACT_TRAIN_FILE", "citation_contexts_layer2_train_slm_v1.jsonl")
+WANDB_ARTIFACT_VAL_FILE = os.getenv("WANDB_ARTIFACT_VAL_FILE", "citation_contexts_layer2_val_slm_v1.jsonl")
 
 TRAINING_MODE = "new"  # "new" = fresh LoRA adapter; "resume" = load adapter weights from S3 first
 
@@ -139,6 +146,41 @@ def load_data(data_file: Path):
     """Load JSONL dataset with chat format messages."""
     dataset = load_dataset("json", data_files=str(data_file))["train"]
     return dataset
+
+
+def _contains_subsequence(ids, sub):
+    """True if token list `sub` occurs contiguously in `ids`."""
+    k = len(sub)
+    return any(ids[i:i + k] == sub for i in range(len(ids) - k + 1))
+
+
+def check_examples(dataset, formatting_func, tokenizer, max_seq_length, response_template_ids, name):
+    """Tokenize every example as the trainer will; abort if any would be truncated
+    or lacks the assistant response template (completion-only loss would then
+    mask the whole example and it would train on nothing)."""
+    lengths, missing = [], []
+    for i, ex in enumerate(dataset):
+        ids = tokenizer(formatting_func(ex), add_special_tokens=False)["input_ids"]
+        lengths.append(len(ids))
+        if not _contains_subsequence(ids[:max_seq_length], response_template_ids):
+            missing.append(i)
+
+    sorted_lengths = sorted(lengths)
+    n = len(sorted_lengths)
+    p99 = sorted_lengths[min(n - 1, int(0.99 * n))]
+    over = sum(1 for length in lengths if length > max_seq_length)
+    print(f"  {name}: tokens max={sorted_lengths[-1]} p99={p99} median={sorted_lengths[n // 2]} "
+          f"(max_seq_length={max_seq_length}); missing response template: {len(missing)}")
+    if over:
+        raise ValueError(
+            f"{over}/{n} {name} examples exceed max_seq_length={max_seq_length} "
+            f"(max {sorted_lengths[-1]} tokens) and would be truncated before the assistant "
+            f"target. Raise --max-seq-length or check the dataset's prompt version.")
+    if missing:
+        raise ValueError(
+            f"{len(missing)}/{n} {name} examples lack the response template "
+            f"{tokenizer.decode(response_template_ids)!r} (first indices: {missing[:10]}). "
+            f"Check the chat template / tokenizer and that every example has an assistant turn.")
 
 
 def train_qlora_context_classifier(
@@ -219,7 +261,7 @@ def train_qlora_context_classifier(
     prompt_metadata = {k: (list(v) if isinstance(v, tuple) else v) for k, v in prompt_cfg.items()}
 
     # trl is only needed for actual training, so pulled in here
-    from trl import SFTTrainer
+    from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
 
     print("=" * 70)
     print("QLoRA Fine-Tuning: Qwen2.5-7B-Instruct for Citation Relation Classification")
@@ -326,6 +368,13 @@ def train_qlora_context_classifier(
     val_dataset = load_data(val_file)
     print(f"  Train samples: {len(train_dataset)}")
     print(f"  Val samples: {len(val_dataset)}")
+    # Loss only on the assistant turn: everything up to and including Qwen's
+    # "<|im_start|>assistant\n" is masked to -100. Token ids (not the string)
+    # so the template matches regardless of surrounding tokenization.
+    response_template_ids = tokenizer.encode("<|im_start|>assistant\n", add_special_tokens=False)
+    check_examples(train_dataset, formatting_func, tokenizer, max_seq_length, response_template_ids, "train")
+    check_examples(val_dataset, formatting_func, tokenizer, max_seq_length, response_template_ids, "val")
+    collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
 
     # Training arguments
     print("\n[5/6] Setting up training...")
@@ -412,6 +461,7 @@ def train_qlora_context_classifier(
         packing=False,  # Chat format doesn't benefit from packing
         max_seq_length=max_seq_length,
         formatting_func=formatting_func,
+        data_collator=collator,
         callbacks=[best_checkpoint_callback],
     )
 
@@ -593,8 +643,8 @@ if __name__ == "__main__":
 #     --wandb-project psm-iiser-citation-relevancy \
 #     --dataset-artifact dataset-context-classification-56main:latest \
 #     --dataset-wandb-project psm-iiser-citation-relevancy \
-#     --train-artifact-file citation_contexts_layer2_train.jsonl \
-#     --val-artifact-file citation_contexts_layer2_val.jsonl \
+#     --train-artifact-file citation_contexts_layer2_train_slm_v1.jsonl \
+#     --val-artifact-file citation_contexts_layer2_val_slm_v1.jsonl \
 #     --version v1 \
 #     --run-name Run-context-classifier-v1 \
 #     --mode new \
@@ -624,8 +674,8 @@ if __name__ == "__main__":
 #     --wandb-project psm-iiser-citation-relevancy \
 #     --dataset-artifact dataset-context-classification-56main:latest \
 #     --dataset-wandb-project psm-iiser-citation-relevancy \
-#     --train-artifact-file citation_contexts_layer2_train.jsonl \
-#     --val-artifact-file citation_contexts_layer2_val.jsonl \
+#     --train-artifact-file citation_contexts_layer2_train_slm_v1.jsonl \
+#     --val-artifact-file citation_contexts_layer2_val_slm_v1.jsonl \
 #     --version v1 \
 #     --run-name Run-context-classifier-v1-resume-from-train-best \
 #     --mode resume \

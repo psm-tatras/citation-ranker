@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--input_dir", required=True,
                      help="Directory whose files are all added to the artifact.")
     ap.add_argument("--prompt_registry", default="LAYER_2_VERSIONS",
-                     choices=["LAYER_2_VERSIONS", "NARRATIVE_VERSIONS"],
+                     choices=["LAYER_2_VERSIONS", "NARRATIVE_VERSIONS", "CITATION_CLASSIFIER_SLM_VERSIONS"],
                      help="Which utils.prompts VERSIONS registry --prompt_version is a key "
                           "into (default: LAYER_2_VERSIONS). Only used if --prompt_version is set.")
     ap.add_argument("--prompt_version", default=None,

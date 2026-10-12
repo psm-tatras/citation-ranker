@@ -68,7 +68,7 @@ class CitationPipelinePredictor:
             shared_tokenizer=self.narrative_model.tokenizer,
             adapter_name="context_classifier",
         )
-
+    # This is Layer 1 - narrative extraction from paper either M or R
     def predict_narrative(self, abstract, max_new_tokens=400):
         """Extract the narrative of one abstract.
 
@@ -76,7 +76,7 @@ class CitationPipelinePredictor:
             dict: {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
         """
         return self.narrative_model.predict(abstract, max_new_tokens=max_new_tokens)
-
+    # This is Layer 2 - identify citation context in M
     def predict_citation_context(self, m_title, m_narrative, r_title, r_narrative,
                                   cite_ctx, relation_max_new_tokens=200):
         """Classify each citation context of one reference.
@@ -108,7 +108,7 @@ class CitationPipelinePredictor:
                 "relation": relation,
             })
         return results
-
+    # This is Layer 3 - for each R in M 1) generate narrative of R, 2) classify R's relation with M
     async def predict_references(self, m_title, m_narrative, ref_contexts, ref_papers_data,
                                    batch_size=8, narrative_max_new_tokens=2048,
                                    relation_max_new_tokens=512):
