@@ -14,6 +14,9 @@ Usage:
         m_title, m_narrative, r_title, r_narrative, cite_ctx)
 """
 
+import traceback
+from collections import defaultdict
+
 from .predict_narrative import NarrativeModel
 from .predict_context_class import ContextClassifierModel
 
@@ -105,6 +108,84 @@ class CitationPipelinePredictor:
                 "relation": relation,
             })
         return results
+
+    async def predict_references(self, m_title, m_narrative, ref_contexts, ref_papers_data,
+                                   batch_size=8, narrative_max_new_tokens=2048,
+                                   relation_max_new_tokens=512):
+        """Batched narrative + relation prediction for every reference of a main paper M.
+
+        Args:
+            m_title, m_narrative: Main paper title and narrative.
+            ref_contexts: {r_id: {"citation_context": [...], "abstract": ...}},
+                e.g. find_citation_context(...)[1][m_id]["references"].
+            ref_papers_data: {r_id: paper_data_or_None}, e.g. from
+                utils.citation_context.get_papers_from_s3(in_corpus_refs_ids).
+            batch_size, narrative_max_new_tokens, relation_max_new_tokens:
+                passed through to the batched narrative/relation calls.
+
+        Returns:
+            dict: {r_id: [{r_id: {abstract, title, m_context, aspect,
+                   facet_relevance}}]}, one entry per usable reference.
+        """
+        from utils.seku_crd_corpus_utils import get_title_and_abstract
+
+        valid_refs = {}  # r_id -> (r_title, r_abstract)
+        for r_id, ref_paper_data in ref_papers_data.items():
+            if ref_paper_data is None or r_id not in ref_contexts:
+                continue
+            try:
+                r_title, r_abstract = get_title_and_abstract(ref_paper_data)
+                valid_refs[r_id] = (r_title, r_abstract)
+            except Exception:
+                print(f"can not process {r_id}, issue {traceback.format_exc()}")
+        print(f"{len(valid_refs)}/{len(ref_papers_data)} references usable for batching")
+
+        narrative_items = [{"id": r_id, "abstract": r_abstract} for r_id, (_, r_abstract) in valid_refs.items()]
+        narrative_results = await self.narrative_model.apredict(
+            narrative_items, batch_size=batch_size, max_new_tokens=narrative_max_new_tokens)
+        r_narratives = {r["id"]: r["narrative"] for r in narrative_results}
+
+        # co_cited: cross-reference (section, sentence_index) across ALL
+        # references of M, since every reference's contexts are available at
+        # once here (unlike predict_citation_context(), which only sees one
+        # reference and defaults co_cited to False).
+        key_to_refs = defaultdict(set)
+        for r_id in valid_refs:
+            for ctx in ref_contexts[r_id]["citation_context"]:
+                key_to_refs[(ctx.get("section"), ctx.get("sentence_index"))].add(r_id)
+
+        relation_items = []
+        for r_id, (r_title, r_abstract) in valid_refs.items():
+            r_narrative = r_narratives[r_id]
+            for i, entry in enumerate(ref_contexts[r_id]["citation_context"]):
+                section = entry.get("section", "")
+                sentence_index = entry.get("sentence_index")
+                co_cited = len(key_to_refs[(section, sentence_index)]) > 1
+                context = {
+                    "m_title": m_title, "m_narrative": m_narrative,
+                    "r_title": r_title, "r_narrative": r_narrative,
+                    "section": section, "co_cited": co_cited,
+                    "before": entry.get("before"), "center": entry.get("center", ""),
+                    "after": entry.get("after"),
+                }
+                relation_items.append({"id": f"{r_id}|{i}", "context": context})
+
+        relation_results = await self.context_model.apredict(
+            relation_items, batch_size=batch_size, max_new_tokens=relation_max_new_tokens)
+        relations_by_item_id = {r["id"]: r["prediction"] for r in relation_results}
+
+        references = {}
+        for r_id, (r_title, r_abstract) in valid_refs.items():
+            r_context = ref_contexts[r_id]["citation_context"]
+            r_class = [relations_by_item_id[f"{r_id}|{i}"] for i in range(len(r_context))]
+            references[r_id] = [{r_id: {
+                "abstract": r_abstract,
+                "title": r_title,
+                "m_context": r_context,
+                "aspect": r_narratives[r_id],
+                "facet_relevance": r_class,
+            }}]
+        return references
 
 
 if __name__ == "__main__":
