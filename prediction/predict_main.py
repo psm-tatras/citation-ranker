@@ -14,8 +14,11 @@ Usage:
         m_title, m_narrative, r_title, r_narrative, cite_ctx)
 """
 
+import gc
 import traceback
 from collections import defaultdict
+
+import torch
 
 from .predict_narrative import NarrativeModel
 from .predict_context_class import ContextClassifierModel
@@ -110,7 +113,8 @@ class CitationPipelinePredictor:
         return results
     # This is Layer 3 - for each R in M 1) generate narrative of R, 2) classify R's relation with M
     async def predict_references(self, m_title, m_narrative, ref_contexts, ref_papers_data,
-                                   batch_size=8, narrative_max_new_tokens=2048,
+                                   narrative_batch_size=8, relation_batch_size=8,
+                                   narrative_max_new_tokens=2048,
                                    relation_max_new_tokens=512):
         """Batched narrative + relation prediction for every reference of a main paper M.
 
@@ -120,8 +124,14 @@ class CitationPipelinePredictor:
                 e.g. find_citation_context(...)[1][m_id]["references"].
             ref_papers_data: {r_id: paper_data_or_None}, e.g. from
                 utils.citation_context.get_papers_from_s3(in_corpus_refs_ids).
-            batch_size, narrative_max_new_tokens, relation_max_new_tokens:
-                passed through to the batched narrative/relation calls.
+            narrative_batch_size, relation_batch_size: batch sizes for the
+                narrative (Layer 1) and relation (Layer 3) batched calls --
+                separate since Layer 3 has one item per CITING SENTENCE
+                (often several per reference), so it can need a smaller
+                batch than Layer 1 (one item per reference) to fit the same
+                GPU budget.
+            narrative_max_new_tokens, relation_max_new_tokens: passed
+                through to the respective batched calls.
 
         Returns:
             dict: {r_id: [{r_id: {abstract, title, m_context, aspect,
@@ -142,8 +152,18 @@ class CitationPipelinePredictor:
 
         narrative_items = [{"id": r_id, "abstract": r_abstract} for r_id, (_, r_abstract) in valid_refs.items()]
         narrative_results = await self.narrative_model.apredict(
-            narrative_items, batch_size=batch_size, max_new_tokens=narrative_max_new_tokens)
+            narrative_items, batch_size=narrative_batch_size, max_new_tokens=narrative_max_new_tokens)
         r_narratives = {r["id"]: r["narrative"] for r in narrative_results}
+
+        # Narrative phase is done and its output already collapsed into
+        # r_narratives above -- narrative_results/narrative_items and the KV
+        # cache/activations PyTorch's allocator is still holding "reserved"
+        # for them are dead weight before the relation phase even starts
+        # allocating its own batch. Release it back now rather than letting
+        # both phases' peaks stack on a 12GB GPU.
+        del narrative_results, narrative_items
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # co_cited: cross-reference (section, sentence_index) across ALL
         # references of M, since every reference's contexts are available at
@@ -171,7 +191,7 @@ class CitationPipelinePredictor:
                 relation_items.append({"id": f"{r_id}|{i}", "context": context})
 
         relation_results = await self.context_model.apredict(
-            relation_items, batch_size=batch_size, max_new_tokens=relation_max_new_tokens)
+            relation_items, batch_size=relation_batch_size, max_new_tokens=relation_max_new_tokens)
         relations_by_item_id = {r["id"]: r["prediction"] for r in relation_results}
 
         references = {}

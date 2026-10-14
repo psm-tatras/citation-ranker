@@ -14,6 +14,11 @@ Model defaults to the QWEN_EMBEDDING_MODEL_NAME env var (see .env -- e.g.
 Qwen/Qwen3-Embedding-4B or the smaller Qwen/Qwen3-Embedding-0.6B); --model
 overrides it explicitly.
 
+Loaded once from the HF Hub, then saved to QWEN_EMBEDDING_MODEL_LOCAL_DIR
+(see .env) and loaded from there on every later run -- this model is only
+used for inference (never fine-tuned), so its weights are static and don't
+need re-downloading each time.
+
 Usage:
     python -m prediction.qwen_embedding --input_dir data/relations
     python -m prediction.qwen_embedding --input_dir data/relations --model Qwen/Qwen3-Embedding-0.6B -n 10 --overwrite
@@ -34,17 +39,19 @@ logger = logging.getLogger(__name__)
 
 
 class AspectSimilarity:
-    ASPECTS = ("TASK", "CONTRIBUTION", "METHOD", "RESULT")
+    ASPECTS = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
 
     INSTRUCTIONS = {
-        "TASK": "Represent the research task or problem addressed by a scientific paper, "
-                "for comparison with the tasks of other papers",
-        "CONTRIBUTION": "Represent the main contribution of a scientific paper, "
-                        "for comparison with the contributions of other papers",
-        "METHOD": "Represent the method or approach used in a scientific paper, "
-                  "for comparison with the methods of other papers",
-        "RESULT": "Represent the findings or results of a scientific paper, "
-                  "for comparison with the results of other papers",
+    "TASK": "Represent the research task or problem addressed by a scientific paper, "
+            "for comparison with the tasks of other papers",
+    "LIMITATION": "Represent the limitation, gap or open problem stated in a scientific paper, "
+                  "for comparison with the limitations of other papers",
+    "CONTRIBUTION": "Represent the main contribution of a scientific paper, "
+                    "for comparison with the contributions of other papers",
+    "METHOD": "Represent the method or approach used in a scientific paper, "
+              "for comparison with the methods of other papers",
+    "RESULT": "Represent the findings or results of a scientific paper, "
+              "for comparison with the results of other papers",
     }
 
     def __init__(
@@ -53,12 +60,23 @@ class AspectSimilarity:
         device: str | None = None,
         batch_size: int = 32,
         max_seq_length: int = 256,
+        local_dir: str | None = None,
     ):
         model_name = model_name or os.getenv("QWEN_EMBEDDING_MODEL_NAME", "Qwen/Qwen3-Embedding-4B")
+        local_dir = local_dir or os.getenv(
+            "QWEN_EMBEDDING_MODEL_LOCAL_DIR",
+            str(Path(__file__).resolve().parent.parent / "model" / "embedding" / "qwen-4B"))
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         dtype = torch.bfloat16 if device.startswith("cuda") else torch.float32
+
+        local_path = Path(local_dir)
+        cached = (local_path / "config.json").is_file()
+        if cached:
+            logger.info("Loading %s from local cache %s", model_name, local_path)
+        else:
+            logger.info("No local cache at %s; downloading %s", local_path, model_name)
         self.model = SentenceTransformer(
-            model_name,
+            str(local_path) if cached else model_name,
             device=device,
             model_kwargs={"torch_dtype": dtype},
             tokenizer_kwargs={"padding_side": "left"},
@@ -66,6 +84,11 @@ class AspectSimilarity:
         self.model.max_seq_length = max_seq_length
         self.batch_size = batch_size
         logger.info("Loaded %s on %s (%s)", model_name, device, dtype)
+
+        if not cached:
+            local_path.mkdir(parents=True, exist_ok=True)
+            self.model.save(str(local_path))
+            logger.info("Saved %s to %s for future runs", model_name, local_path)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -200,6 +223,10 @@ def main():
     parser.add_argument("--device", default=None)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--max_seq_length", type=int, default=256)
+    parser.add_argument("--local_dir", default=None,
+                         help="Defaults to QWEN_EMBEDDING_MODEL_LOCAL_DIR env var, else "
+                              "model/embedding/qwen-4B. Loaded from here if already cached, "
+                              "else downloaded once and saved here for future runs.")
     parser.add_argument("-n", "--limit", type=int, default=None, help="Process only first N files")
     parser.add_argument("--overwrite", action="store_true", help="Recompute existing aspect_similarity")
     args = parser.parse_args()
@@ -207,7 +234,7 @@ def main():
         parser.error("pass exactly one of --input_dir or --input_file")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    sim = AspectSimilarity(args.model, args.device, args.batch_size, args.max_seq_length)
+    sim = AspectSimilarity(args.model, args.device, args.batch_size, args.max_seq_length, args.local_dir)
     try:
         sim.run(input_dir=args.input_dir, input_file=args.input_file,
                 pattern=args.pattern, limit=args.limit, overwrite=args.overwrite)
