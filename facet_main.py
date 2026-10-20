@@ -188,6 +188,8 @@ if __name__ == "__main__":
                           "real narrative JSON output measured around ~270 tokens, so lowering this "
                           "(e.g. to 400-600) is the single biggest GPU memory lever if you hit OOM -- a batch "
                           "pads/grows its KV cache toward this cap if even one sequence doesn't stop cleanly")
+    ap.add_argument("--nb-ids", type=int, default=None,
+                     help="Process only the first N ids from --ids-file (default: all)")
     ap.add_argument("--save", action="store_true", help="Write result JSON file(s) to --output-dir instead of printing them")
     ap.add_argument("--output-dir", default=str(project_root / "data" / "facet_predictions"))
     args = ap.parse_args()
@@ -217,23 +219,53 @@ if __name__ == "__main__":
 
     if args.ids_file:
         with open(args.ids_file) as f:
-            main_paper_ids = [line.strip() for line in f if line.strip()]
-        print(f"Loaded {len(main_paper_ids)} main paper id(s) from {args.ids_file}")
+            raw_lines = [line.strip() for line in f if line.strip()]
 
-        on_result = None
+        # Entries look like "2305.09630:Physics" -- take the id, drop the domain.
+        main_paper_ids = []
+        skipped_slash_ids = []
+        for line in raw_lines:
+            paper_id = line.split(":")[0].strip()
+            if "/" in paper_id:
+                # e.g. "hep-th/0404065" -- building an output path from this
+                # (out_dir / f"{paper_id}.json") would create a nested
+                # "hep-th/" subdirectory instead of a flat filename. Skip
+                # rather than special-case the path construction.
+                skipped_slash_ids.append(paper_id)
+                continue
+            main_paper_ids.append(paper_id)
+
+        print(f"Loaded {len(main_paper_ids)} main paper id(s) from {args.ids_file}")
+        if skipped_slash_ids:
+            print(f"Skipped {len(skipped_slash_ids)} id(s) containing '/' "
+                  f"(would break output path construction): {skipped_slash_ids}")
+
+        if args.nb_ids:
+            main_paper_ids = main_paper_ids[:args.nb_ids]
+            print(f"Capped to the first {len(main_paper_ids)} id(s) via --nb-ids {args.nb_ids}")
+
         if args.save:
             out_dir = Path(args.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
 
-            def on_result(main_paper_id, result):
-                # Write THIS paper's result immediately, not after the whole
-                # id list finishes -- otherwise a crash/OOM/kill partway
-                # through a long run (thousands of papers) loses every
-                # result computed so far, even the ones already done.
+        processed_file = project_root / "data" / "M_test_set_processed.txt"
+
+        def on_result(main_paper_id, result):
+            # Write THIS paper's result immediately, not after the whole id
+            # list finishes -- otherwise a crash/OOM/kill partway through a
+            # long run (thousands of papers) loses every result computed so
+            # far, even the ones already done.
+            if args.save:
                 out_path = out_dir / f"{main_paper_id}.json"
                 with open(out_path, "w") as f:
                     json.dump(result, f, indent=3)
                 print(f"Wrote -> {out_path}")
+            # Mark as processed so a future --ids-file run can skip it (see
+            # the companion snippet for filtering a candidate list against
+            # this file).
+            with open(processed_file, "a") as f:
+                f.write(f"{main_paper_id}\n")
+            print(f"Marked {main_paper_id} as processed -> {processed_file}")
 
         results = asyncio.run(facet_analyse_many(
             main_paper_ids, paper_index, predictor, citation_ctx_extractor,

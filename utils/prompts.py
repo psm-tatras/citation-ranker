@@ -931,6 +931,14 @@ NARRATIVE_VERSIONS = {
     },
 }
 
+# Single source of truth for the current (v2) aspect/narrative label set --
+# downstream scripts (utils/generate_report.py, utils/facet_scoring.py,
+# prediction/qwen_embedding.py) import THIS instead of hand-typing their own
+# copy of the tuple, so a hardcoded list can't silently drift out of sync
+# with the real schema the way utils/generate_report.py's ASPECT_KEYS once did
+# (it was missing RESULT entirely).
+ASPECT_KEYS = NARRATIVE_VERSIONS["v2"]["labels"]
+
 # ============================================================================
 # LAYER 2: CITATION RELATION FUNCTION (v1)
 # ============================================================================

@@ -35,11 +35,13 @@ import torch
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
+from utils.prompts import ASPECT_KEYS
+
 logger = logging.getLogger(__name__)
 
 
 class AspectSimilarity:
-    ASPECTS = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
+    ASPECTS = ASPECT_KEYS
 
     INSTRUCTIONS = {
     "TASK": "Represent the research task or problem addressed by a scientific paper, "

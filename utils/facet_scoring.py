@@ -49,14 +49,16 @@ import math
 import os
 from pathlib import Path
 
+from utils.prompts import ASPECT_KEYS as ASPECTS
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Weights and constants (hard-coded for the draft; to become user-configurable)
 # ---------------------------------------------------------------------------
-ASPECTS = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
-
-# aspect -> key in R["aspect_similarity"]; LIMITATION is not computed yet
+# aspect -> key in R["aspect_similarity"] (identity mapping; kept as an
+# explicit dict in case a future aspect's key in aspect_similarity ever
+# diverges from its name in ASPECTS)
 SIM_KEYS = {
     "TASK": "TASK",
     "LIMITATION": "LIMITATION",
