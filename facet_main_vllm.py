@@ -30,13 +30,54 @@ Usage (CLI):
 """
 
 import asyncio
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
+import boto3
+from botocore.config import Config
+
+import utils.seku_crd_corpus_utils as corpus
 from prediction.predict_main_vllm import CitationPipelinePredictorVLLM
 from utils.citation_context import CitationContextExtractor
-from utils.seku_crd_corpus_utils import get_paper_from_s3, get_papers_from_s3, get_title_and_abstract
+from utils.seku_crd_corpus_utils import get_paper_from_s3, get_title_and_abstract
+
+# One S3 client and one fetch pool for the whole process. boto3 clients are
+# thread-safe once created, but creating them concurrently from the default
+# session is not -- so create it once, under a lock.
+S3_FETCH_WORKERS = 16
+_s3_client = None
+_s3_lock = threading.Lock()
+_fetch_pool = ThreadPoolExecutor(max_workers=S3_FETCH_WORKERS)
+
+
+def _get_s3_client():
+    global _s3_client
+    with _s3_lock:
+        if _s3_client is None:
+            _s3_client = boto3.client(
+                "s3",
+                aws_access_key_id=corpus.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=corpus.AWS_SECRET_ACCESS_KEY,
+                region_name=corpus.AWS_REGION,
+                config=Config(max_pool_connections=S3_FETCH_WORKERS * 2, retries={"max_attempts": 3}),
+            )
+        return _s3_client
+
+
+def _slim_paper(paper):
+    """Keep only what the predictor reads from a reference paper (title,
+    abstract) so full texts are not held in memory. get_title_and_abstract()
+    returns the same values for the slim and the full record."""
+    if paper is None:
+        return None
+    title, abstract = get_title_and_abstract(paper)
+    return {"metadata": {"title": title}, "abstract": abstract}
+
+
+def _fetch_slim(paper_id):
+    return _slim_paper(get_paper_from_s3(paper_id, s3_client=_get_s3_client()))
 
 
 def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references=32):
@@ -48,7 +89,9 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
         (find_citation_context writes it to ./temp_paper_text.json and the
         extractor re-reads that file once per reference);
       - reference papers are fetched once, concurrently (find_citation_context
-        fetches them one by one, and facet_analyse fetches them again).
+        fetches them one by one, and facet_analyse fetches them again), through
+        one shared S3 client, and reduced to title + abstract immediately so
+        full texts never accumulate in memory.
     No shared temp file, so several papers can be prepared in parallel threads.
 
     Returns:
@@ -57,7 +100,7 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
     """
     m_data = paper_index[main_paper_id]
     m_title = m_data["title"]
-    main_paper_data = get_paper_from_s3(main_paper_id)
+    main_paper_data = get_paper_from_s3(main_paper_id, s3_client=_get_s3_client())
     if main_paper_data is None:
         raise RuntimeError(f"main paper {main_paper_id!r} not found in S3")
     _, m_abstract = get_title_and_abstract(main_paper_data)
@@ -65,7 +108,9 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
     in_corpus_refs_ids = m_data["in_corpus_references"]
     if max_references != -1:
         in_corpus_refs_ids = in_corpus_refs_ids[:max_references]
-    ref_papers_data = asyncio.run(get_papers_from_s3(in_corpus_refs_ids))
+    # Fetched concurrently on the shared pool and slimmed right away: only
+    # title + abstract of each reference is kept.
+    ref_papers_data = dict(zip(in_corpus_refs_ids, _fetch_pool.map(_fetch_slim, in_corpus_refs_ids)))
 
     # Same per-reference logic as find_citation_context(): keep references
     # with at least one citation context; errors are per reference.
@@ -79,6 +124,7 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
         except Exception as e:
             print(f"  ref {ref_paper_id}: {e}")
     print(f"Extracted context for {main_paper_id} success [{len(ref_contexts)}/{len(in_corpus_refs_ids)}]")
+    del main_paper_data  # full text no longer needed
 
     return {"m_id": main_paper_id, "m_title": m_title, "m_abstract": m_abstract,
             "ref_contexts": ref_contexts, "ref_papers_data": ref_papers_data}
@@ -161,7 +207,7 @@ async def facet_analyse(main_paper_id, paper_index, predictor, citation_ctx_extr
 
 async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ctx_extractor,
                              max_references=32, narrative_max_new_tokens=2048,
-                             relation_max_new_tokens=512, chunk_size=32, prep_workers=4,
+                             relation_max_new_tokens=512, chunk_size=16, prep_workers=4,
                              on_result=None):
     """Run the pipeline for many main papers in chunks of chunk_size.
 
@@ -242,7 +288,7 @@ if __name__ == "__main__":
                     help="Max tokens generated per narrative call (outputs average ~270 tokens)")
     ap.add_argument("--relation-max-new-tokens", type=int, default=512,
                     help="Max tokens generated per relation-classification call")
-    ap.add_argument("--chunk-size", type=int, default=32,
+    ap.add_argument("--chunk-size", type=int, default=16,
                     help="Main papers per vLLM chunk (all their prompts are submitted together)")
     ap.add_argument("--prep-workers", type=int, default=4,
                     help="Main papers prepared (S3 fetch + citation-context extraction) in parallel")
