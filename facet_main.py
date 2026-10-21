@@ -171,7 +171,14 @@ if __name__ == "__main__":
                      help="Text file of main paper ids, one per line, to analyse in bulk "
                           "(mutually exclusive with main_paper_id)")
     ap.add_argument("--max-references", type=int, default=32, help="Cap on references processed (-1 for all)")
-    ap.add_argument("--max-index-files", type=int, default=4096, help="load_paper_index's max_files cap (-1 for all)")
+
+    def _max_index_files(value):
+        if value.strip().lower() == "all":
+            return -1
+        return int(value)
+
+    ap.add_argument("--max-index-files", type=_max_index_files, default=4096,
+                     help="load_paper_index's max_files cap. Pass an int, or 'All' to load the full index")
     ap.add_argument("--context-checkpoint-kind", choices=["final", "train-best", "eval-best"], default="train-best",
                      help="Which context-classifier W&B artifact to load: 'final' (default full-run adapter), "
                           "'train-best', or 'eval-best'")
