@@ -10,7 +10,9 @@ Differences from facet_main.py:
     adapters per request, so there is no set_adapter() race and no need to run
     papers one at a time.
   - S3 / citation-context preparation (CPU + network) for the NEXT chunk runs
-    in a background thread while the GPU works on the current chunk.
+    in the background while the GPU works on the current chunk, with
+    --prep-workers papers prepared in parallel; each main paper and its
+    references are fetched once (see prepare_paper).
   - --skip-processed resumes a run from the processed-ids file (spot restarts).
 
 Output per paper is the same dict as facet_main.facet_analyse():
@@ -33,16 +35,21 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from prediction.predict_main_vllm import CitationPipelinePredictorVLLM
-from utils.citation_context import CitationContextExtractor, find_citation_context
+from utils.citation_context import CitationContextExtractor
 from utils.seku_crd_corpus_utils import get_paper_from_s3, get_papers_from_s3, get_title_and_abstract
 
 
 def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references=32):
     """CPU/network part of facet_analyse() for one main paper (no GPU).
 
-    Same data steps as facet_main.facet_analyse(). Not thread-safe across
-    papers (find_citation_context writes ./temp_paper_text.json), so call it
-    from one thread at a time.
+    Produces the same ref_contexts as utils.citation_context.find_citation_context(),
+    but faster:
+      - the main paper is fetched once and passed to the extractor as a dict
+        (find_citation_context writes it to ./temp_paper_text.json and the
+        extractor re-reads that file once per reference);
+      - reference papers are fetched once, concurrently (find_citation_context
+        fetches them one by one, and facet_analyse fetches them again).
+    No shared temp file, so several papers can be prepared in parallel threads.
 
     Returns:
         dict job for CitationPipelinePredictorVLLM.predict_papers():
@@ -51,37 +58,50 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
     m_data = paper_index[main_paper_id]
     m_title = m_data["title"]
     main_paper_data = get_paper_from_s3(main_paper_id)
+    if main_paper_data is None:
+        raise RuntimeError(f"main paper {main_paper_id!r} not found in S3")
     _, m_abstract = get_title_and_abstract(main_paper_data)
-
-    status, cite_ctx = find_citation_context(
-        main_paper_id, bulk_paper_index=paper_index,
-        citation_context_extractor=citation_ctx_extractor, max_refs=max_references)
-    if not status:
-        raise RuntimeError(f"find_citation_context failed for main_paper_id={main_paper_id!r}")
-    ref_contexts = cite_ctx[main_paper_id]["references"]
 
     in_corpus_refs_ids = m_data["in_corpus_references"]
     if max_references != -1:
         in_corpus_refs_ids = in_corpus_refs_ids[:max_references]
     ref_papers_data = asyncio.run(get_papers_from_s3(in_corpus_refs_ids))
 
+    # Same per-reference logic as find_citation_context(): keep references
+    # with at least one citation context; errors are per reference.
+    ref_contexts = {}
+    for ref_paper_id in in_corpus_refs_ids:
+        try:
+            result = citation_ctx_extractor.extract(main_paper_data, ref_paper_id)
+            if result:
+                _, ref_abstract = get_title_and_abstract(ref_papers_data.get(ref_paper_id))
+                ref_contexts[ref_paper_id] = {"citation_context": result, "abstract": ref_abstract}
+        except Exception as e:
+            print(f"  ref {ref_paper_id}: {e}")
+    print(f"Extracted context for {main_paper_id} success [{len(ref_contexts)}/{len(in_corpus_refs_ids)}]")
+
     return {"m_id": main_paper_id, "m_title": m_title, "m_abstract": m_abstract,
             "ref_contexts": ref_contexts, "ref_papers_data": ref_papers_data}
 
 
-def prepare_chunk(main_paper_ids, paper_index, citation_ctx_extractor, max_references=32):
-    """prepare_paper() over a chunk; a failure on one paper is logged and skipped.
+def prepare_chunk(main_paper_ids, paper_index, citation_ctx_extractor, max_references=32,
+                  prep_workers=4):
+    """prepare_paper() over a chunk with prep_workers papers in parallel; a
+    failure on one paper is logged and skipped.
 
     Returns:
         list of jobs (successful papers only, input order).
     """
-    jobs = []
-    for main_paper_id in main_paper_ids:
+    def _safe(main_paper_id):
         try:
-            jobs.append(prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references))
+            return prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references)
         except Exception:
             print(f"can not prepare {main_paper_id}, issue {traceback.format_exc()}")
-    return jobs
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, prep_workers)) as pool:
+        jobs = list(pool.map(_safe, main_paper_ids))
+    return [job for job in jobs if job is not None]
 
 
 def _to_result(job, pred):
@@ -141,11 +161,12 @@ async def facet_analyse(main_paper_id, paper_index, predictor, citation_ctx_extr
 
 async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ctx_extractor,
                              max_references=32, narrative_max_new_tokens=2048,
-                             relation_max_new_tokens=512, chunk_size=32, on_result=None):
+                             relation_max_new_tokens=512, chunk_size=32, prep_workers=4,
+                             on_result=None):
     """Run the pipeline for many main papers in chunks of chunk_size.
 
-    Data preparation for chunk k+1 runs in a single background thread while
-    the GPU processes chunk k. A failure on one paper (preparation or
+    Data preparation for chunk k+1 runs in the background (prep_workers papers
+    in parallel) while the GPU processes chunk k. A failure on one paper (preparation or
     prediction) is logged and does not stop the rest.
 
     Args:
@@ -164,12 +185,13 @@ async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ct
     done = 0
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(prepare_chunk, chunks[0], paper_index, citation_ctx_extractor, max_references)
+        future = pool.submit(prepare_chunk, chunks[0], paper_index, citation_ctx_extractor,
+                             max_references, prep_workers)
         for k in range(len(chunks)):
             jobs = await asyncio.wrap_future(future)
             if k + 1 < len(chunks):
                 future = pool.submit(prepare_chunk, chunks[k + 1], paper_index,
-                                     citation_ctx_extractor, max_references)
+                                     citation_ctx_extractor, max_references, prep_workers)
             for job, result in _predict_jobs(jobs, predictor, narrative_max_new_tokens,
                                              relation_max_new_tokens):
                 if result is None:
@@ -222,6 +244,8 @@ if __name__ == "__main__":
                     help="Max tokens generated per relation-classification call")
     ap.add_argument("--chunk-size", type=int, default=32,
                     help="Main papers per vLLM chunk (all their prompts are submitted together)")
+    ap.add_argument("--prep-workers", type=int, default=4,
+                    help="Main papers prepared (S3 fetch + citation-context extraction) in parallel")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                     help="Fraction of GPU memory vLLM may use")
     ap.add_argument("--max-model-len", type=int, default=8192,
@@ -321,6 +345,7 @@ if __name__ == "__main__":
             narrative_max_new_tokens=args.narrative_max_new_tokens,
             relation_max_new_tokens=args.relation_max_new_tokens,
             chunk_size=args.chunk_size,
+            prep_workers=args.prep_workers,
             on_result=on_result,
         ))
         print(f"Succeeded: {len(results)}/{len(main_paper_ids)}")
