@@ -10,9 +10,12 @@ Differences from facet_main.py:
     adapters per request, so there is no set_adapter() race and no need to run
     papers one at a time.
   - S3 / citation-context preparation (CPU + network) for the NEXT chunk runs
-    in the background while the GPU works on the current chunk, with
-    --prep-workers papers prepared in parallel; each main paper and its
-    references are fetched once (see prepare_paper).
+    in the background while the GPU works on the current chunk, in
+    --prep-workers separate PROCESSES (it is CPU-bound Python, so threads
+    would share one core); each main paper and its references are fetched
+    once (see prepare_paper).
+  - Only the paper-index entries of the main papers being processed are kept
+    in memory (the full index is several GB; references come from S3).
   - --skip-processed resumes a run from the processed-ids file (spot restarts).
 
 Output per paper is the same dict as facet_main.facet_analyse():
@@ -30,17 +33,20 @@ Usage (CLI):
 """
 
 import asyncio
+import json
+import multiprocessing as mp
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
 
 import utils.seku_crd_corpus_utils as corpus
-from prediction.predict_main_vllm import CitationPipelinePredictorVLLM
 from utils.citation_context import CitationContextExtractor
+# CitationPipelinePredictorVLLM (vLLM + torch) is imported only in __main__, so
+# the spawned preparation workers, which import this module, stay small.
 from utils.seku_crd_corpus_utils import get_paper_from_s3, get_title_and_abstract
 
 # One S3 client and one fetch pool for the whole process. boto3 clients are
@@ -99,13 +105,18 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
         {m_id, m_title, m_abstract, ref_contexts, ref_papers_data}
     """
     m_data = paper_index[main_paper_id]
-    m_title = m_data["title"]
+    return _prepare_core(main_paper_id, m_data["title"], m_data["in_corpus_references"],
+                         citation_ctx_extractor, max_references)
+
+
+def _prepare_core(main_paper_id, m_title, in_corpus_refs_ids, citation_ctx_extractor,
+                  max_references=32):
+    """prepare_paper() without the paper-index lookup (runs in prep workers)."""
     main_paper_data = get_paper_from_s3(main_paper_id, s3_client=_get_s3_client())
     if main_paper_data is None:
         raise RuntimeError(f"main paper {main_paper_id!r} not found in S3")
     _, m_abstract = get_title_and_abstract(main_paper_data)
 
-    in_corpus_refs_ids = m_data["in_corpus_references"]
     if max_references != -1:
         in_corpus_refs_ids = in_corpus_refs_ids[:max_references]
     # Fetched concurrently on the shared pool and slimmed right away: only
@@ -130,24 +141,76 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
             "ref_contexts": ref_contexts, "ref_papers_data": ref_papers_data}
 
 
+_worker_extractors = {}
+
+
+def _prep_task(task):
+    """Process-pool entry point: (main_paper_id, m_title, refs, max_references,
+    context_window) -> job or None. Errors are logged, not raised."""
+    main_paper_id, m_title, refs, max_references, context_window = task
+    try:
+        extractor = _worker_extractors.get(context_window)
+        if extractor is None:
+            extractor = _worker_extractors[context_window] = CitationContextExtractor(S=context_window)
+        return _prepare_core(main_paper_id, m_title, refs, extractor, max_references)
+    except Exception:
+        print(f"can not prepare {main_paper_id}, issue {traceback.format_exc()}", flush=True)
+        return None
+
+
+def make_prep_executor(prep_workers):
+    """Process pool for preparation ('spawn': the parent holds CUDA/vLLM state,
+    which must not be forked). None -> prepare in the calling thread."""
+    if prep_workers <= 0:
+        return None
+    return ProcessPoolExecutor(max_workers=prep_workers, mp_context=mp.get_context("spawn"))
+
+
 def prepare_chunk(main_paper_ids, paper_index, citation_ctx_extractor, max_references=32,
-                  prep_workers=4):
-    """prepare_paper() over a chunk with prep_workers papers in parallel; a
-    failure on one paper is logged and skipped.
+                  executor=None):
+    """Prepare a chunk of main papers, on `executor` (a make_prep_executor()
+    pool) if given; a failure on one paper is logged and skipped.
 
     Returns:
         list of jobs (successful papers only, input order).
     """
-    def _safe(main_paper_id):
-        try:
-            return prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references)
-        except Exception:
-            print(f"can not prepare {main_paper_id}, issue {traceback.format_exc()}")
-            return None
-
-    with ThreadPoolExecutor(max_workers=max(1, prep_workers)) as pool:
-        jobs = list(pool.map(_safe, main_paper_ids))
+    tasks = []
+    for main_paper_id in main_paper_ids:
+        m_data = paper_index.get(main_paper_id)
+        if m_data is None:
+            print(f"can not prepare {main_paper_id}, issue: not in the paper index")
+            continue
+        tasks.append((main_paper_id, m_data["title"], m_data["in_corpus_references"],
+                      max_references, citation_ctx_extractor.S))
+    if executor is None:
+        jobs = [_prep_task(t) for t in tasks]
+    else:
+        jobs = list(executor.map(_prep_task, tasks))
     return [job for job in jobs if job is not None]
+
+
+def load_index_subset(wanted_ids, max_files=-1, paper_index_file=None):
+    """Read the paper index JSONL but keep only the records of wanted_ids.
+
+    Same file and max_files semantics as utils.seku_crd_corpus_utils.load_paper_index()
+    (-1 = whole file), without holding every record in memory.
+
+    Returns:
+        {paper_id: record} for the wanted ids found.
+    """
+    wanted = set(wanted_ids)
+    limit = 200000 if max_files == -1 else max_files
+    path = paper_index_file or corpus.PAPER_INDEX_FILE
+    subset = {}
+    with open(path, "r") as f:
+        for n, line in enumerate(f, 1):
+            rec = json.loads(line)
+            if rec["paper_id"] in wanted:
+                subset[rec["paper_id"]] = rec
+            if n >= limit or len(subset) == len(wanted):
+                break
+    print(f"Paper index: kept {len(subset)}/{len(wanted)} wanted record(s) from {path}")
+    return subset
 
 
 def _to_result(job, pred):
@@ -207,12 +270,12 @@ async def facet_analyse(main_paper_id, paper_index, predictor, citation_ctx_extr
 
 async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ctx_extractor,
                              max_references=32, narrative_max_new_tokens=2048,
-                             relation_max_new_tokens=512, chunk_size=16, prep_workers=4,
+                             relation_max_new_tokens=512, chunk_size=16, prep_workers=3,
                              on_result=None):
     """Run the pipeline for many main papers in chunks of chunk_size.
 
-    Data preparation for chunk k+1 runs in the background (prep_workers papers
-    in parallel) while the GPU processes chunk k. A failure on one paper (preparation or
+    Data preparation for chunk k+1 runs in the background (prep_workers
+    worker processes) while the GPU processes chunk k. A failure on one paper (preparation or
     prediction) is logged and does not stop the rest.
 
     Args:
@@ -230,26 +293,31 @@ async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ct
 
     done = 0
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(prepare_chunk, chunks[0], paper_index, citation_ctx_extractor,
-                             max_references, prep_workers)
-        for k in range(len(chunks)):
-            jobs = await asyncio.wrap_future(future)
-            if k + 1 < len(chunks):
-                future = pool.submit(prepare_chunk, chunks[k + 1], paper_index,
-                                     citation_ctx_extractor, max_references, prep_workers)
-            for job, result in _predict_jobs(jobs, predictor, narrative_max_new_tokens,
-                                             relation_max_new_tokens):
-                if result is None:
-                    continue
-                results[job["m_id"]] = result
-                if on_result is not None:
-                    on_result(job["m_id"], result)
-            done += len(chunks[k])
-            elapsed = time.time() - t0
-            print(f"[chunk {k + 1}/{len(chunks)}] ids done {done}/{len(main_paper_ids)}, "
-                  f"succeeded {len(results)}, {elapsed / 60:.1f} min elapsed, "
-                  f"{3600 * done / max(elapsed, 1e-9):.0f} papers/h")
+    executor = make_prep_executor(prep_workers)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(prepare_chunk, chunks[0], paper_index, citation_ctx_extractor,
+                                 max_references, executor)
+            for k in range(len(chunks)):
+                jobs = await asyncio.wrap_future(future)
+                if k + 1 < len(chunks):
+                    future = pool.submit(prepare_chunk, chunks[k + 1], paper_index,
+                                         citation_ctx_extractor, max_references, executor)
+                for job, result in _predict_jobs(jobs, predictor, narrative_max_new_tokens,
+                                                 relation_max_new_tokens):
+                    if result is None:
+                        continue
+                    results[job["m_id"]] = result
+                    if on_result is not None:
+                        on_result(job["m_id"], result)
+                done += len(chunks[k])
+                elapsed = time.time() - t0
+                print(f"[chunk {k + 1}/{len(chunks)}] ids done {done}/{len(main_paper_ids)}, "
+                      f"succeeded {len(results)}, {elapsed / 60:.1f} min elapsed, "
+                      f"{3600 * done / max(elapsed, 1e-9):.0f} papers/h", flush=True)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
     return results
 
 
@@ -262,7 +330,7 @@ if __name__ == "__main__":
     from pathlib import Path
     from dotenv import load_dotenv
 
-    from utils.seku_crd_corpus_utils import load_paper_index
+    from prediction.predict_main_vllm import CitationPipelinePredictorVLLM
 
     project_root = Path(__file__).resolve().parent
     load_dotenv(project_root / ".env", override=True)
@@ -281,7 +349,9 @@ if __name__ == "__main__":
         return int(value)
 
     ap.add_argument("--max-index-files", type=_max_index_files, default=4096,
-                    help="load_paper_index's max_files cap. Pass an int, or 'All' to load the full index")
+                    help="Lines of the paper index to scan (same as load_paper_index's max_files). "
+                         "Pass an int, or 'All' to scan the full index; only the requested main "
+                         "papers' records are kept in memory")
     ap.add_argument("--context-checkpoint-kind", choices=["final", "train-best", "eval-best"], default="train-best",
                     help="Which context-classifier W&B artifact to load: 'final', 'train-best', or 'eval-best'")
     ap.add_argument("--narrative-max-new-tokens", type=int, default=2048,
@@ -290,8 +360,9 @@ if __name__ == "__main__":
                     help="Max tokens generated per relation-classification call")
     ap.add_argument("--chunk-size", type=int, default=16,
                     help="Main papers per vLLM chunk (all their prompts are submitted together)")
-    ap.add_argument("--prep-workers", type=int, default=4,
-                    help="Main papers prepared (S3 fetch + citation-context extraction) in parallel")
+    ap.add_argument("--prep-workers", type=int, default=3,
+                    help="Worker processes preparing main papers (S3 fetch + citation-context "
+                         "extraction) in parallel; 0 = prepare in the main process")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                     help="Fraction of GPU memory vLLM may use")
     ap.add_argument("--max-model-len", type=int, default=8192,
@@ -318,24 +389,22 @@ if __name__ == "__main__":
     context_classifier_local_dir = os.environ.get(
         "CONTEXT_CLASSIFIER_MODEL_LOCAL_DIR", str(project_root / "model" / "context_classifier"))
 
-    print("Loading paper index...")
-    paper_index = load_paper_index(max_files=args.max_index_files)
-
-    print("Loading models (vLLM)...")
-    predictor = CitationPipelinePredictorVLLM(
-        narrative_local_dir=narrative_local_dir,
-        context_classifier_local_dir=context_classifier_local_dir,
-        narrative_checkpoint_kind="train-best",
-        narrative_wandb_version="latest",
-        narrative_version="v2",
-        context_checkpoint_kind=None if args.context_checkpoint_kind == "final" else args.context_checkpoint_kind,
-        context_wandb_version="latest",
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_num_seqs=args.max_num_seqs,
-        enforce_eager=args.enforce_eager,
-    )
-    citation_ctx_extractor = CitationContextExtractor()
+    def load_models():
+        print("Loading models (vLLM)...")
+        predictor = CitationPipelinePredictorVLLM(
+            narrative_local_dir=narrative_local_dir,
+            context_classifier_local_dir=context_classifier_local_dir,
+            narrative_checkpoint_kind="train-best",
+            narrative_wandb_version="latest",
+            narrative_version="v2",
+            context_checkpoint_kind=None if args.context_checkpoint_kind == "final" else args.context_checkpoint_kind,
+            context_wandb_version="latest",
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_num_seqs=args.max_num_seqs,
+            enforce_eager=args.enforce_eager,
+        )
+        return predictor, CitationContextExtractor()
 
     if args.ids_file:
         with open(args.ids_file) as f:
@@ -370,6 +439,10 @@ if __name__ == "__main__":
             main_paper_ids = main_paper_ids[:args.nb_ids]
             print(f"Capped to the first {len(main_paper_ids)} id(s) via --nb-ids {args.nb_ids}")
 
+        print("Loading paper index (requested main papers only)...")
+        paper_index = load_index_subset(main_paper_ids, max_files=args.max_index_files)
+        predictor, citation_ctx_extractor = load_models()
+
         if args.save:
             out_dir = Path(args.output_dir)
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -399,6 +472,10 @@ if __name__ == "__main__":
         if not args.save:
             print(json.dumps(results, indent=2))
     else:
+        print("Loading paper index (requested main paper only)...")
+        paper_index = load_index_subset([args.main_paper_id], max_files=args.max_index_files)
+        predictor, citation_ctx_extractor = load_models()
+
         result = asyncio.run(facet_analyse(
             args.main_paper_id, paper_index, predictor, citation_ctx_extractor,
             max_references=args.max_references,
