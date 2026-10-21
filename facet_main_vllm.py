@@ -9,11 +9,13 @@ Differences from facet_main.py:
     citation contexts of the chunk in a second call. vLLM serves both LoRA
     adapters per request, so there is no set_adapter() race and no need to run
     papers one at a time.
-  - S3 / citation-context preparation (CPU + network) for the NEXT chunk runs
-    in the background while the GPU works on the current chunk, in
-    --prep-workers separate PROCESSES (it is CPU-bound Python, so threads
-    would share one core); each main paper and its references are fetched
-    once (see prepare_paper).
+  - S3 / citation-context preparation (CPU + network) runs continuously in
+    --prep-workers separate PROCESSES (CPU-bound Python, so threads would share
+    one core); each GPU batch takes the next --chunk-size papers that are ready,
+    so a slow paper never holds up a batch. Each main paper and its references
+    are fetched once (see prepare_paper); sentence splitting uses
+    FastCitationContextExtractor (same output, no quadratic cost); slow papers
+    are cut by --prep-ref-budget / --prep-timeout.
   - Only the paper-index entries of the main papers being processed are kept
     in memory (the full index is several GB; references come from S3).
   - --skip-processed resumes a run from the processed-ids file (spot restarts).
@@ -35,9 +37,12 @@ Usage (CLI):
 import asyncio
 import json
 import multiprocessing as mp
+import signal
+import string
 import threading
 import time
 import traceback
+from collections import OrderedDict, deque
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 import boto3
@@ -67,7 +72,9 @@ def _get_s3_client():
                 aws_access_key_id=corpus.AWS_ACCESS_KEY_ID,
                 aws_secret_access_key=corpus.AWS_SECRET_ACCESS_KEY,
                 region_name=corpus.AWS_REGION,
-                config=Config(max_pool_connections=S3_FETCH_WORKERS * 2, retries={"max_attempts": 3}),
+                # Timeouts so a stalled connection is retried instead of hanging a worker.
+                config=Config(max_pool_connections=S3_FETCH_WORKERS * 2, retries={"max_attempts": 3},
+                              connect_timeout=10, read_timeout=60),
             )
         return _s3_client
 
@@ -84,6 +91,55 @@ def _slim_paper(paper):
 
 def _fetch_slim(paper_id):
     return _slim_paper(get_paper_from_s3(paper_id, s3_client=_get_s3_client()))
+
+
+_ASCII_LETTERS = frozenset(string.ascii_letters)
+_ABBR_CHARS = frozenset(string.ascii_letters + ".")
+
+
+class FastCitationContextExtractor(CitationContextExtractor):
+    """CitationContextExtractor with the same output, without its quadratic cost.
+
+    - _is_abbreviation(): the original copies text[:dot_pos] and runs a regex
+      over it at EVERY "." -- quadratic in section length (minutes on long
+      sections). Here the same word is found by scanning back from the dot.
+    - split_sentences(): extract() re-splits a section once per cited
+      reference; results are cached per section text (LRU).
+    utils/citation_context.py is unchanged.
+    """
+
+    def __init__(self, S=2, split_cache_size=256):
+        super().__init__(S=S)
+        self._split_cache = OrderedDict()
+        self._split_cache_size = split_cache_size
+
+    def _is_abbreviation(self, text, dot_pos):
+        # Same word as re.search(r"([A-Za-z][A-Za-z.]*)$", text[:dot_pos]):
+        # the run of [A-Za-z.] ending at the dot, from its first letter.
+        # "$" also matches before a single trailing newline.
+        end = dot_pos - 1 if dot_pos > 0 and text[dot_pos - 1] == "\n" else dot_pos
+        j = end
+        while j > 0 and text[j - 1] in _ABBR_CHARS:
+            j -= 1
+        while j < end and text[j] not in _ASCII_LETTERS:
+            j += 1
+        if j == end:
+            return False
+        word = text[j:end]
+        if len(word) == 1 and word.isupper():  # author initial, e.g. "K."
+            return True
+        return word.lower() in self.ABBREVIATIONS
+
+    def split_sentences(self, text):
+        cached = self._split_cache.get(text)
+        if cached is not None:
+            self._split_cache.move_to_end(text)
+            return cached
+        spans = super().split_sentences(text)
+        self._split_cache[text] = spans
+        if len(self._split_cache) > self._split_cache_size:
+            self._split_cache.popitem(last=False)
+        return spans
 
 
 def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_references=32):
@@ -110,8 +166,13 @@ def prepare_paper(main_paper_id, paper_index, citation_ctx_extractor, max_refere
 
 
 def _prepare_core(main_paper_id, m_title, in_corpus_refs_ids, citation_ctx_extractor,
-                  max_references=32):
-    """prepare_paper() without the paper-index lookup (runs in prep workers)."""
+                  max_references=32, ref_time_budget=None):
+    """prepare_paper() without the paper-index lookup (runs in prep workers).
+
+    ref_time_budget: seconds; once context extraction for this paper has run
+    that long, the remaining references are skipped (logged) and the paper is
+    kept with the references done so far.
+    """
     main_paper_data = get_paper_from_s3(main_paper_id, s3_client=_get_s3_client())
     if main_paper_data is None:
         raise RuntimeError(f"main paper {main_paper_id!r} not found in S3")
@@ -126,7 +187,12 @@ def _prepare_core(main_paper_id, m_title, in_corpus_refs_ids, citation_ctx_extra
     # Same per-reference logic as find_citation_context(): keep references
     # with at least one citation context; errors are per reference.
     ref_contexts = {}
-    for ref_paper_id in in_corpus_refs_ids:
+    t_start = time.time()
+    for n_done, ref_paper_id in enumerate(in_corpus_refs_ids):
+        if ref_time_budget is not None and time.time() - t_start > ref_time_budget:
+            print(f"  {main_paper_id}: extraction over {ref_time_budget}s, "
+                  f"skipped {len(in_corpus_refs_ids) - n_done} remaining reference(s)", flush=True)
+            break
         try:
             result = citation_ctx_extractor.extract(main_paper_data, ref_paper_id)
             if result:
@@ -144,18 +210,47 @@ def _prepare_core(main_paper_id, m_title, in_corpus_refs_ids, citation_ctx_extra
 _worker_extractors = {}
 
 
+class _PrepTimeout(Exception):
+    pass
+
+
+def _raise_prep_timeout(signum, frame):
+    raise _PrepTimeout()
+
+
+def _make_task(main_paper_id, m_data, max_references, context_window,
+               ref_time_budget=120, hard_timeout=300):
+    return (main_paper_id, m_data["title"], m_data["in_corpus_references"],
+            max_references, context_window, ref_time_budget, hard_timeout)
+
+
 def _prep_task(task):
-    """Process-pool entry point: (main_paper_id, m_title, refs, max_references,
-    context_window) -> job or None. Errors are logged, not raised."""
-    main_paper_id, m_title, refs, max_references, context_window = task
+    """Process-pool entry point -> job or None. Errors are logged, not raised.
+
+    task: (main_paper_id, m_title, refs, max_references, context_window,
+           ref_time_budget, hard_timeout). hard_timeout (seconds, SIGALRM; only
+    in a worker's main thread) skips the whole paper if it still runs.
+    """
+    main_paper_id, m_title, refs, max_references, context_window, ref_budget, hard_timeout = task
+    use_alarm = bool(hard_timeout) and threading.current_thread() is threading.main_thread()
+    if use_alarm:
+        previous = signal.signal(signal.SIGALRM, _raise_prep_timeout)
+        signal.alarm(int(hard_timeout))
     try:
         extractor = _worker_extractors.get(context_window)
         if extractor is None:
-            extractor = _worker_extractors[context_window] = CitationContextExtractor(S=context_window)
-        return _prepare_core(main_paper_id, m_title, refs, extractor, max_references)
+            extractor = _worker_extractors[context_window] = FastCitationContextExtractor(S=context_window)
+        return _prepare_core(main_paper_id, m_title, refs, extractor, max_references, ref_budget)
+    except _PrepTimeout:
+        print(f"can not prepare {main_paper_id}, issue: preparation over {hard_timeout}s, skipped", flush=True)
+        return None
     except Exception:
         print(f"can not prepare {main_paper_id}, issue {traceback.format_exc()}", flush=True)
         return None
+    finally:
+        if use_alarm:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
 
 
 def make_prep_executor(prep_workers):
@@ -180,8 +275,7 @@ def prepare_chunk(main_paper_ids, paper_index, citation_ctx_extractor, max_refer
         if m_data is None:
             print(f"can not prepare {main_paper_id}, issue: not in the paper index")
             continue
-        tasks.append((main_paper_id, m_data["title"], m_data["in_corpus_references"],
-                      max_references, citation_ctx_extractor.S))
+        tasks.append(_make_task(main_paper_id, m_data, max_references, citation_ctx_extractor.S))
     if executor is None:
         jobs = [_prep_task(t) for t in tasks]
     else:
@@ -271,12 +365,18 @@ async def facet_analyse(main_paper_id, paper_index, predictor, citation_ctx_extr
 async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ctx_extractor,
                              max_references=32, narrative_max_new_tokens=2048,
                              relation_max_new_tokens=512, chunk_size=16, prep_workers=3,
-                             on_result=None):
-    """Run the pipeline for many main papers in chunks of chunk_size.
+                             prep_ref_budget=120, prep_timeout=300, on_result=None):
+    """Run the pipeline for many main papers, chunk_size papers per GPU batch.
 
-    Data preparation for chunk k+1 runs in the background (prep_workers
-    worker processes) while the GPU processes chunk k. A failure on one paper (preparation or
-    prediction) is logged and does not stop the rest.
+    Preparation runs continuously in prep_workers processes (several chunks'
+    worth in flight); each GPU batch takes the next chunk_size papers that are
+    READY, so one slow paper delays only itself, not a whole chunk. Results
+    may therefore be saved in a different order than main_paper_ids.
+
+    A paper whose context extraction exceeds prep_ref_budget seconds keeps the
+    references done so far; one still running after prep_timeout seconds is
+    skipped. Any failure (preparation or prediction) is logged and does not
+    stop the rest.
 
     Args:
         on_result: optional callback(main_paper_id, result), invoked right
@@ -286,35 +386,70 @@ async def facet_analyse_many(main_paper_ids, paper_index, predictor, citation_ct
     Returns:
         dict: {main_paper_id: result}, one entry per successful id.
     """
-    chunks = [main_paper_ids[i:i + chunk_size] for i in range(0, len(main_paper_ids), chunk_size)]
     results = {}
-    if not chunks:
+    tasks = deque()
+    for main_paper_id in main_paper_ids:
+        m_data = paper_index.get(main_paper_id)
+        if m_data is None:
+            print(f"can not prepare {main_paper_id}, issue: not in the paper index")
+            continue
+        tasks.append(_make_task(main_paper_id, m_data, max_references, citation_ctx_extractor.S,
+                                prep_ref_budget, prep_timeout))
+    if not tasks:
         return results
 
-    done = 0
-    t0 = time.time()
+    total = len(main_paper_ids)
+    max_in_flight = max(chunk_size * 2, prep_workers * 4)
     executor = make_prep_executor(prep_workers)
+    loop = asyncio.get_running_loop()
+    in_flight, ready = set(), []
+    attempted, batch_no, t0 = total - len(tasks), 0, time.time()
+
+    def top_up():
+        while tasks and len(in_flight) < max_in_flight:
+            task = tasks.popleft()
+            if executor is None:
+                fut = loop.run_in_executor(None, _prep_task, task)
+            else:
+                fut = asyncio.wrap_future(executor.submit(_prep_task, task))
+            in_flight.add(fut)
+
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(prepare_chunk, chunks[0], paper_index, citation_ctx_extractor,
-                                 max_references, executor)
-            for k in range(len(chunks)):
-                jobs = await asyncio.wrap_future(future)
-                if k + 1 < len(chunks):
-                    future = pool.submit(prepare_chunk, chunks[k + 1], paper_index,
-                                         citation_ctx_extractor, max_references, executor)
-                for job, result in _predict_jobs(jobs, predictor, narrative_max_new_tokens,
-                                                 relation_max_new_tokens):
-                    if result is None:
-                        continue
-                    results[job["m_id"]] = result
-                    if on_result is not None:
-                        on_result(job["m_id"], result)
-                done += len(chunks[k])
-                elapsed = time.time() - t0
-                print(f"[chunk {k + 1}/{len(chunks)}] ids done {done}/{len(main_paper_ids)}, "
-                      f"succeeded {len(results)}, {elapsed / 60:.1f} min elapsed, "
-                      f"{3600 * done / max(elapsed, 1e-9):.0f} papers/h", flush=True)
+        top_up()
+        while in_flight or ready:
+            # collect finished preparations until a full batch is ready
+            while in_flight and len(ready) < chunk_size:
+                done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+                for fut in done:
+                    in_flight.discard(fut)
+                    try:
+                        job = fut.result()
+                    except Exception:
+                        print(f"preparation worker failed, issue {traceback.format_exc()}")
+                        job = None
+                    if job is None:
+                        attempted += 1
+                    else:
+                        ready.append(job)
+                top_up()
+            batch, ready = ready[:chunk_size], ready[chunk_size:]
+            if not batch:
+                continue
+            # GPU; preparation of later papers keeps running in the workers
+            for job, result in _predict_jobs(batch, predictor, narrative_max_new_tokens,
+                                             relation_max_new_tokens):
+                attempted += 1
+                if result is None:
+                    continue
+                results[job["m_id"]] = result
+                if on_result is not None:
+                    on_result(job["m_id"], result)
+            top_up()
+            batch_no += 1
+            elapsed = time.time() - t0
+            print(f"[batch {batch_no}] ids done {attempted}/{total}, succeeded {len(results)}, "
+                  f"{elapsed / 60:.1f} min elapsed, {3600 * len(results) / max(elapsed, 1e-9):.0f} papers/h "
+                  f"(preparing {len(in_flight)}, ready {len(ready)}, queued {len(tasks)})", flush=True)
     finally:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
@@ -363,6 +498,10 @@ if __name__ == "__main__":
     ap.add_argument("--prep-workers", type=int, default=3,
                     help="Worker processes preparing main papers (S3 fetch + citation-context "
                          "extraction) in parallel; 0 = prepare in the main process")
+    ap.add_argument("--prep-ref-budget", type=int, default=120,
+                    help="Seconds of context extraction per main paper; remaining references are skipped after that")
+    ap.add_argument("--prep-timeout", type=int, default=300,
+                    help="Seconds after which a main paper still being prepared is skipped")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90,
                     help="Fraction of GPU memory vLLM may use")
     ap.add_argument("--max-model-len", type=int, default=8192,
@@ -404,7 +543,7 @@ if __name__ == "__main__":
             max_num_seqs=args.max_num_seqs,
             enforce_eager=args.enforce_eager,
         )
-        return predictor, CitationContextExtractor()
+        return predictor, FastCitationContextExtractor()
 
     if args.ids_file:
         with open(args.ids_file) as f:
@@ -465,6 +604,8 @@ if __name__ == "__main__":
             relation_max_new_tokens=args.relation_max_new_tokens,
             chunk_size=args.chunk_size,
             prep_workers=args.prep_workers,
+            prep_ref_budget=args.prep_ref_budget,
+            prep_timeout=args.prep_timeout,
             on_result=on_result,
         ))
         print(f"Succeeded: {len(results)}/{len(main_paper_ids)}")
