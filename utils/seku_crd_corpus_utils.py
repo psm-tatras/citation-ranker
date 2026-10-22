@@ -21,7 +21,7 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # SOURCE_INDEX_FILE = "/Work/Experiments/citation-processor-ranker/data/unarxive/processed/source_index_2024.jsonl"
-PAPER_INDEX_FILE = "/Work/IISER/citation-data/SEKU-CRD-v1/paper_index_2024.jsonl"
+PAPER_INDEX_FILE = "/home/ubuntu/citation-ranker/citation-ranker/data/paper_index_2024.jsonl"
 # FULL_PAPERS_FILE = "/Work/Experiments/citation-processor-ranker/data/unarxive/processed/full_papers_2024.jsonl"
 
 

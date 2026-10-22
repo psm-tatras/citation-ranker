@@ -115,6 +115,7 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
     def __init__(self, tokenizer, s3_bucket: str, s3_key_prefix_root: str,
                  wandb_run, adapter_artifact_name: str,
                  artifact_metadata_extra: dict = None,
+                 adapter_extra_files: dict = None,
                  tmp_root: str = "checkpoints/_best_tmp",
                  overwrite_kinds=frozenset({"train"}),
                  initial_best_train_loss: float = float("inf"),
@@ -125,6 +126,11 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
         self.wandb_run = wandb_run
         self.adapter_artifact_name = adapter_artifact_name
         self.artifact_metadata_extra = artifact_metadata_extra or {}
+        # {filename: JSON-serializable obj} written next to the adapter weights
+        # (so they ship to S3 with it) and attached to the W&B artifact -- e.g.
+        # the context classifier's prompt.json, so the adapter is usable
+        # without consulting W&B metadata.
+        self.adapter_extra_files = adapter_extra_files or {}
         self.tmp_root = Path(tmp_root)
         self.overwrite_kinds = overwrite_kinds
         # For a fresh run these stay +inf (any first result counts as best).
@@ -160,6 +166,9 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
             adapter_dir = self.tmp_root / kind / "adapter_model"
             model.save_pretrained(adapter_dir)
             self.tokenizer.save_pretrained(adapter_dir)
+            for filename, content in self.adapter_extra_files.items():
+                with open(adapter_dir / filename, "w", encoding="utf-8") as f:
+                    json.dump(content, f, indent=2, ensure_ascii=False)
 
             if overwrite:
                 # Fixed path, re-uploaded in place -- no timestamp, no accumulation.
@@ -204,6 +213,8 @@ class BestCheckpointS3WandbCallback(TrainerCallback):
             # different content, so a new version is created every time.
             with artifact.new_file("pointer.json", mode="w") as f:
                 json.dump(artifact.metadata, f, indent=2, default=str)
+            for filename in self.adapter_extra_files:
+                artifact.add_file(str(adapter_dir / filename), name=filename)
             self.wandb_run.log_artifact(artifact)
             print(f"✓ New best {kind} ({metric_name}={metric_value:.4f}) -> {s3_uri}  (W&B: {artifact_name}, metadata only)")
 

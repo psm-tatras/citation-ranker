@@ -259,6 +259,10 @@ def train_qlora_context_classifier(
     functions = list(prompt_cfg["functions"])
     # JSON/W&B-safe: tuples aren't valid in wandb config/metadata payloads.
     prompt_metadata = {k: (list(v) if isinstance(v, tuple) else v) for k, v in prompt_cfg.items()}
+    # Saved as prompt.json inside every adapter_model/ dir (train-best,
+    # eval-best, final), so the prompt ships to S3 with the weights and is
+    # also attached as a file to each W&B model artifact.
+    prompt_file = {"registry": "CITATION_CLASSIFIER_SLM_VERSIONS", "version": version, **prompt_metadata}
 
     # trl is only needed for actual training, so pulled in here
     from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
@@ -391,8 +395,8 @@ def train_qlora_context_classifier(
         logging_steps=10,
         save_steps=save_steps,
         eval_steps=save_steps,
-        eval_strategy="epoch",
-        save_strategy="epoch",
+        eval_strategy="steps",
+        save_strategy="steps",
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
@@ -446,6 +450,7 @@ def train_qlora_context_classifier(
             "prompt": prompt_metadata,
             "dataset_artifact": dataset_artifact_ref,
         },
+        adapter_extra_files={"prompt.json": prompt_file},
         tmp_root=str(output_dir / "_best_tmp"),
         initial_best_train_loss=initial_best_train_loss,
         initial_best_eval_loss=initial_best_eval_loss,
@@ -477,8 +482,12 @@ def train_qlora_context_classifier(
     print("=" * 70)
     model.save_pretrained(output_dir / "adapter_model")
     tokenizer.save_pretrained(output_dir / "adapter_model")
+    prompt_path = output_dir / "adapter_model" / "prompt.json"
+    with open(prompt_path, "w", encoding="utf-8") as f:
+        json.dump(prompt_file, f, indent=2, ensure_ascii=False)
     print(f"✓ Adapter saved to: {output_dir}/adapter_model")
     print(f"✓ Tokenizer saved to: {output_dir}/adapter_model")
+    print(f"✓ Training prompt ({version}) saved to: {prompt_path}")
 
     # Print adapter size
     adapter_size = sum(
@@ -538,6 +547,7 @@ def train_qlora_context_classifier(
     # as a small JSON file gives each version genuinely different content.
     with adapter_artifact.new_file("pointer.json", mode="w") as f:
         json.dump(adapter_artifact.metadata, f, indent=2, default=str)
+    adapter_artifact.add_file(str(prompt_path), name="prompt.json")
 
     # Local reference file only (not uploaded to W&B).
     if s3_uri:
