@@ -16,7 +16,8 @@ Output (<m_id>_bl.json):
         "facet_similarity": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "percentile":       {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "bm25":             {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
-        "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+        "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
+        "scincl":           {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
       },
       ...
     }
@@ -30,7 +31,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from utils.baseline_methods import bm25, iter_r_entries, load_json, save_json, specter2
+from utils.baseline_methods import bm25, iter_r_entries, load_json, save_json, scincl, specter2
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +52,12 @@ def initialize(paper_json, output_dir):
     return out_path
 
 
-def run_baselines(paper_json, output_dir, specter2_model):
+def run_baselines(paper_json, output_dir, specter2_model, scincl_model):
     """initialize() + every baseline for one main paper; returns the _bl.json path."""
     bl_json = initialize(paper_json, output_dir)
     bm25(paper_json, bl_json)
     specter2(paper_json, bl_json, specter2_model)
+    scincl(paper_json, bl_json, scincl_model)
     return bl_json
 
 
@@ -70,13 +72,14 @@ def main():
     p = Path(args.input)
     files = [p] if p.is_file() else sorted(p.glob(args.pattern))
 
-    from utils.embedding_utils import Specter2Model
+    from utils.embedding_utils import SciNCLModel, Specter2Model
     specter2_model = Specter2Model()
+    scincl_model = SciNCLModel()
 
     done = failed = 0
     for path in files:
         try:
-            out = run_baselines(path, args.output_dir, specter2_model)
+            out = run_baselines(path, args.output_dir, specter2_model, scincl_model)
         except Exception as exc:
             failed += 1
             logger.error("%s: %s", path.name, exc)

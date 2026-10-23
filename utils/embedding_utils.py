@@ -151,6 +151,52 @@ class Specter2Model:
         return out
 
 
+class SciNCLModel:
+    """SciNCL encoder: malteos/scincl (plain BERT, no adapter), CLS pooling,
+    L2-normalised vectors.
+
+    First run downloads the model from the HF Hub and saves it to local_dir
+    (SCINCL_LOCAL_DIR, default model/embedding/scincl); later runs load from
+    local_dir only.
+    """
+
+    MODEL = "malteos/scincl"
+    MAX_LENGTH = 512
+
+    def __init__(self, local_dir=None, device=None, batch_size=32):
+        self.local_dir = local_dir or os.environ.get(
+            "SCINCL_LOCAL_DIR",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "model", "embedding", "scincl"))
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+
+        if os.path.isfile(os.path.join(self.local_dir, "config.json")):
+            self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True)
+            self.model = AutoModel.from_pretrained(self.local_dir, local_files_only=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL)
+            self.model = AutoModel.from_pretrained(self.MODEL)
+            os.makedirs(self.local_dir, exist_ok=True)
+            self.tokenizer.save_pretrained(self.local_dir)
+            self.model.save_pretrained(self.local_dir)
+        self.model.to(self.device).eval()
+
+    def encode(self, texts):
+        """{text: L2-normalised CLS embedding (torch.Tensor, cpu)} for unique texts."""
+        texts = list(dict.fromkeys(texts))
+        out = {}
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True,
+                                 max_length=self.MAX_LENGTH, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                cls = self.model(**enc).last_hidden_state[:, 0, :]
+            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
+            out.update(zip(batch, cls))
+        return out
+
+
 def reference_relevance_computation(base_text, ref_dict, embedding_model):
     """Cosine-similarity relevance of each reference text to base_text.
 

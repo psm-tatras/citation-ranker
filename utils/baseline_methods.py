@@ -31,11 +31,19 @@ SPECTER2 cosine similarity, per aspect a:
     SPECTER2(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)               (raw cosine, [-1, 1])
     SPECTER2 is null when M_a or R_a is empty.
 
+SciNCL cosine similarity, per aspect a:
+
+    e(x)            = L2-normalised CLS embedding of text x from SciNCL (malteos/scincl, max 512 tokens)
+    SciNCL(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)                 (raw cosine, [-1, 1])
+    SciNCL is null when M_a or R_a is empty.
+
 Output per reference in <m_id>_bl.json:
     "bm25":     {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (BM25(T_M,T_R), BM25(L_M,L_R), BM25(C_M,C_R), BM25(M_M,M_R), BM25(R_M,R_R))
     "specter2": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (SPECTER2(T_M,T_R), ..., SPECTER2(R_M,R_R))
+    "scincl":   {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+                = (SciNCL(T_M,T_R), ..., SciNCL(R_M,R_R))
 
 Functions:
     iter_r_entries   (r_id, entry) for every reference of a FACET record
@@ -44,8 +52,11 @@ Functions:
     tokenize         lowercase alphanumeric tokens without stopwords
     bm25_scores      raw BM25 of one query against a list of documents (Lucene IDF)
     bm25             adds "bm25" to every reference of <m_id>_bl.json
+    embedding_cosine shared per-aspect cosine loop for embedding baselines (any model with encode())
     specter2         adds "specter2" to every reference of <m_id>_bl.json
                      (model: utils.embedding_utils.Specter2Model, loaded once by the caller)
+    scincl           adds "scincl" to every reference of <m_id>_bl.json
+                     (model: utils.embedding_utils.SciNCLModel, loaded once by the caller)
 """
 
 import json
@@ -64,6 +75,7 @@ BM25_K1 = 1.5
 BM25_B = 0.75
 BM25_KEY = "bm25"
 SPECTER2_KEY = "specter2"
+SCINCL_KEY = "scincl"
 ROUND = 4
 
 STOPWORDS = frozenset("""
@@ -164,7 +176,7 @@ def bm25(paper_json, bl_json):
 
 
 # ---------------------------------------------------------------------------
-# Baseline: SPECTER2 cosine similarity per aspect
+# Baselines: embedding cosine similarity per aspect (SPECTER2, SciNCL)
 # ---------------------------------------------------------------------------
 def _clean(text):
     """Whitespace-normalised text, or None if empty/non-string."""
@@ -176,6 +188,16 @@ def _clean(text):
 
 def specter2(paper_json, bl_json, model):
     """Add "specter2" {5 aspects} to every reference of bl_json (in place); model: Specter2Model."""
+    return embedding_cosine(paper_json, bl_json, model, SPECTER2_KEY)
+
+
+def scincl(paper_json, bl_json, model):
+    """Add "scincl" {5 aspects} to every reference of bl_json (in place); model: SciNCLModel."""
+    return embedding_cosine(paper_json, bl_json, model, SCINCL_KEY)
+
+
+def embedding_cosine(paper_json, bl_json, model, key):
+    """Add key: {5 aspects} cosine(e(M_a), e(R_a)) to every reference of bl_json (in place)."""
     record = load_json(paper_json)
     bl = load_json(bl_json)
 
@@ -194,6 +216,6 @@ def specter2(paper_json, bl_json, model):
                 sims[r_id][a] = round(float(m_vec @ vecs[t]), ROUND)
 
     for r_id, sim in sims.items():
-        bl.setdefault(r_id, {})[SPECTER2_KEY] = sim
+        bl.setdefault(r_id, {})[key] = sim
     save_json(bl, bl_json)
     return len(sims)
