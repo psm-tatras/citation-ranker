@@ -3,6 +3,7 @@ torch
 transformers
 datasets
 peft
+adapters
 trl
 bitsandbytes
 accelerate

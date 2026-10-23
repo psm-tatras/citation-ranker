@@ -24,9 +24,18 @@ BM25 (Okapi, Lucene IDF), per aspect a in {TASK, LIMITATION, CONTRIBUTION, METHO
     tokens(): lowercase, alphanumeric tokens, English stopwords removed, no stemming.
     BM25 is null when M_a or R_a is empty.
 
+SPECTER2 cosine similarity, per aspect a:
+
+    e(x)              = L2-normalised CLS embedding of text x from SPECTER2
+                        (allenai/specter2_base + proximity adapter allenai/specter2, max 512 tokens)
+    SPECTER2(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)               (raw cosine, [-1, 1])
+    SPECTER2 is null when M_a or R_a is empty.
+
 Output per reference in <m_id>_bl.json:
-    "bm25": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
-            = (BM25(T_M,T_R), BM25(L_M,L_R), BM25(C_M,C_R), BM25(M_M,M_R), BM25(R_M,R_R))
+    "bm25":     {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+                = (BM25(T_M,T_R), BM25(L_M,L_R), BM25(C_M,C_R), BM25(M_M,M_R), BM25(R_M,R_R))
+    "specter2": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+                = (SPECTER2(T_M,T_R), ..., SPECTER2(R_M,R_R))
 
 Functions:
     iter_r_entries   (r_id, entry) for every reference of a FACET record
@@ -35,6 +44,8 @@ Functions:
     tokenize         lowercase alphanumeric tokens without stopwords
     bm25_scores      raw BM25 of one query against a list of documents (Lucene IDF)
     bm25             adds "bm25" to every reference of <m_id>_bl.json
+    specter2         adds "specter2" to every reference of <m_id>_bl.json
+                     (model: utils.embedding_utils.Specter2Model, loaded once by the caller)
 """
 
 import json
@@ -52,6 +63,7 @@ ASPECTS = ("TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT")
 BM25_K1 = 1.5
 BM25_B = 0.75
 BM25_KEY = "bm25"
+SPECTER2_KEY = "specter2"
 ROUND = 4
 
 STOPWORDS = frozenset("""
@@ -147,5 +159,41 @@ def bm25(paper_json, bl_json):
 
     for r_id, sim in sims.items():
         bl.setdefault(r_id, {})[BM25_KEY] = sim
+    save_json(bl, bl_json)
+    return len(sims)
+
+
+# ---------------------------------------------------------------------------
+# Baseline: SPECTER2 cosine similarity per aspect
+# ---------------------------------------------------------------------------
+def _clean(text):
+    """Whitespace-normalised text, or None if empty/non-string."""
+    if not isinstance(text, str):
+        return None
+    text = " ".join(text.split())
+    return text or None
+
+
+def specter2(paper_json, bl_json, model):
+    """Add "specter2" {5 aspects} to every reference of bl_json (in place); model: Specter2Model."""
+    record = load_json(paper_json)
+    bl = load_json(bl_json)
+
+    entries = list(iter_r_entries(record))
+    m_aspects = record.get("m_aspects") or {}
+    sims = {r_id: dict.fromkeys(ASPECTS) for r_id, _ in entries}
+    for a in ASPECTS:
+        m_text = _clean(m_aspects.get(a))
+        if m_text is None:
+            continue
+        r_texts = {r_id: _clean((e.get("aspect") or {}).get(a)) for r_id, e in entries}
+        vecs = model.encode([m_text] + [t for t in r_texts.values() if t])
+        m_vec = vecs[m_text]
+        for r_id, t in r_texts.items():
+            if t is not None:
+                sims[r_id][a] = round(float(m_vec @ vecs[t]), ROUND)
+
+    for r_id, sim in sims.items():
+        bl.setdefault(r_id, {})[SPECTER2_KEY] = sim
     save_json(bl, bl_json)
     return len(sims)

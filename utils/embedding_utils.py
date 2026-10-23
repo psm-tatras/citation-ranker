@@ -93,6 +93,64 @@ class EmbeddingModel:
         return embeddings
 
 
+class Specter2Model:
+    """SPECTER2 encoder: allenai/specter2_base + proximity adapter allenai/specter2
+    (adapters library), CLS pooling, L2-normalised vectors.
+
+    First run downloads base + adapter from the HF Hub and saves them to
+    local_dir (SPECTER2_LOCAL_DIR, default model/embedding/specter2); later
+    runs load from local_dir only.
+    """
+
+    BASE_MODEL = "allenai/specter2_base"
+    ADAPTER = "allenai/specter2"
+    ADAPTER_NAME = "specter2"
+    MAX_LENGTH = 512
+
+    def __init__(self, local_dir=None, device=None, batch_size=32):
+        from adapters import AutoAdapterModel  # only needed for SPECTER2
+
+        self.local_dir = local_dir or os.environ.get(
+            "SPECTER2_LOCAL_DIR",
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "model", "embedding", "specter2"))
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+        adapter_dir = os.path.join(self.local_dir, "adapter")
+
+        if os.path.isfile(os.path.join(self.local_dir, "config.json")) and os.path.isdir(adapter_dir):
+            self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True)
+            self.model = AutoAdapterModel.from_pretrained(self.local_dir, local_files_only=True)
+            self.model.load_adapter(adapter_dir, load_as=self.ADAPTER_NAME, set_active=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.BASE_MODEL)
+            self.model = AutoAdapterModel.from_pretrained(self.BASE_MODEL)
+            self.model.load_adapter(self.ADAPTER, source="hf", load_as=self.ADAPTER_NAME, set_active=True)
+            os.makedirs(self.local_dir, exist_ok=True)
+            self.tokenizer.save_pretrained(self.local_dir)
+            self.model.save_pretrained(self.local_dir)
+            self.model.save_adapter(adapter_dir, self.ADAPTER_NAME)
+        # save_pretrained() also stores the adapter, so a local reload "overwrites" it
+        # and set_active is dropped -- activate explicitly.
+        self.model.set_active_adapters(self.ADAPTER_NAME)
+        self.model.to(self.device).eval()
+
+    def encode(self, texts):
+        """{text: L2-normalised CLS embedding (torch.Tensor, cpu)} for unique texts."""
+        texts = list(dict.fromkeys(texts))
+        out = {}
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True,
+                                 max_length=self.MAX_LENGTH, return_token_type_ids=False,
+                                 return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                cls = self.model(**enc).last_hidden_state[:, 0, :]
+            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
+            out.update(zip(batch, cls))
+        return out
+
+
 def reference_relevance_computation(base_text, ref_dict, embedding_model):
     """Cosine-similarity relevance of each reference text to base_text.
 

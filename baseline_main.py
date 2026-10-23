@@ -8,14 +8,15 @@ Functions:
     initialize      paper JSON -> <output_dir>/<m_id>_bl.json holding, per reference,
                     the FACET facet_similarity and percentile vectors; returns its path
     run_baselines   initialize() + every baseline for one M
-    main            CLI: a FACET JSON file or a directory of them
+    main            CLI: a FACET JSON file or a directory of them; loads models once
 
 Output (<m_id>_bl.json):
     {
       "<r_id>": {
         "facet_similarity": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "percentile":       {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
-        "bm25":             {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+        "bm25":             {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
+        "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
       },
       ...
     }
@@ -29,7 +30,7 @@ import argparse
 import logging
 from pathlib import Path
 
-from utils.baseline_methods import bm25, iter_r_entries, load_json, save_json
+from utils.baseline_methods import bm25, iter_r_entries, load_json, save_json, specter2
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,11 @@ def initialize(paper_json, output_dir):
     return out_path
 
 
-def run_baselines(paper_json, output_dir):
+def run_baselines(paper_json, output_dir, specter2_model):
     """initialize() + every baseline for one main paper; returns the _bl.json path."""
     bl_json = initialize(paper_json, output_dir)
     bm25(paper_json, bl_json)
+    specter2(paper_json, bl_json, specter2_model)
     return bl_json
 
 
@@ -67,10 +69,14 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     p = Path(args.input)
     files = [p] if p.is_file() else sorted(p.glob(args.pattern))
+
+    from utils.embedding_utils import Specter2Model
+    specter2_model = Specter2Model()
+
     done = failed = 0
     for path in files:
         try:
-            out = run_baselines(path, args.output_dir)
+            out = run_baselines(path, args.output_dir, specter2_model)
         except Exception as exc:
             failed += 1
             logger.error("%s: %s", path.name, exc)
