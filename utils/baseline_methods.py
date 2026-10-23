@@ -1,10 +1,10 @@
 """
 baseline_methods.py
 
-Baseline M->R scores for judging FACET ranking quality. Driven by baseline_main.py:
-each baseline reads the FACET output JSON of one main paper M (read-only, for texts)
-and adds its own key to every reference in <m_id>_bl.json (created by
-baseline_main.initialize), updating that file in place.
+Baseline M->R scores for judging FACET ranking quality. Driven by baseline_main.py,
+which loads each main paper's FACET output JSON (`record`) and its <m_id>_bl.json
+dict (`bl`) once; every baseline works in memory and adds its own key to every
+reference in `bl`. baseline_main writes `bl` back once per paper.
 
 Metrics
 -------
@@ -51,12 +51,11 @@ Functions:
     save_json        write a JSON file atomically
     tokenize         lowercase alphanumeric tokens without stopwords
     bm25_scores      raw BM25 of one query against a list of documents (Lucene IDF)
-    bm25             adds "bm25" to every reference of <m_id>_bl.json
-    embedding_cosine shared per-aspect cosine loop for embedding baselines (any model with encode())
-    specter2         adds "specter2" to every reference of <m_id>_bl.json
-                     (model: utils.embedding_utils.Specter2Model, loaded once by the caller)
-    scincl           adds "scincl" to every reference of <m_id>_bl.json
-                     (model: utils.embedding_utils.SciNCLModel, loaded once by the caller)
+    bm25             adds "bm25" to every reference of bl (CPU)
+    aspect_texts     unique non-empty aspect texts of M and its references (input to encode())
+    embedding_cosine adds key: per-aspect cosine to every reference of bl, from precomputed vectors
+    specter2         embedding_cosine with key "specter2" (vectors: utils.embedding_utils.Specter2Model)
+    scincl           embedding_cosine with key "scincl"   (vectors: utils.embedding_utils.SciNCLModel)
 """
 
 import json
@@ -148,11 +147,8 @@ def bm25_scores(query, docs, k1=BM25_K1, b=BM25_B):
     return scores
 
 
-def bm25(paper_json, bl_json):
-    """Add "bm25" {5 aspects} to every reference of bl_json (in place), using texts from paper_json."""
-    record = load_json(paper_json)
-    bl = load_json(bl_json)
-
+def bm25(record, bl):
+    """Add "bm25" {5 aspects} to every reference of bl (in memory), using texts from record."""
     entries = list(iter_r_entries(record))
     m_aspects = record.get("m_aspects") or {}
     sims = {r_id: dict.fromkeys(ASPECTS) for r_id, _ in entries}
@@ -166,13 +162,12 @@ def bm25(paper_json, bl_json):
             if toks:
                 ids.append(r_id)
                 docs.append(toks)
-        for r_id, s in zip(ids, bm25_scores(query, docs)):
-            sims[r_id][a] = round(s, ROUND)
+        for r_id, sc in zip(ids, bm25_scores(query, docs)):
+            sims[r_id][a] = round(sc, ROUND)
 
     for r_id, sim in sims.items():
         bl.setdefault(r_id, {})[BM25_KEY] = sim
-    save_json(bl, bl_json)
-    return len(sims)
+    return bl
 
 
 # ---------------------------------------------------------------------------
@@ -186,21 +181,18 @@ def _clean(text):
     return text or None
 
 
-def specter2(paper_json, bl_json, model):
-    """Add "specter2" {5 aspects} to every reference of bl_json (in place); model: Specter2Model."""
-    return embedding_cosine(paper_json, bl_json, model, SPECTER2_KEY)
+def aspect_texts(record):
+    """Set of unique non-empty (cleaned) aspect texts of M and all its references."""
+    texts = {_clean(t) for t in (record.get("m_aspects") or {}).values()}
+    for _, e in iter_r_entries(record):
+        texts.update(_clean(t) for t in (e.get("aspect") or {}).values())
+    texts.discard(None)
+    return texts
 
 
-def scincl(paper_json, bl_json, model):
-    """Add "scincl" {5 aspects} to every reference of bl_json (in place); model: SciNCLModel."""
-    return embedding_cosine(paper_json, bl_json, model, SCINCL_KEY)
-
-
-def embedding_cosine(paper_json, bl_json, model, key):
-    """Add key: {5 aspects} cosine(e(M_a), e(R_a)) to every reference of bl_json (in place)."""
-    record = load_json(paper_json)
-    bl = load_json(bl_json)
-
+def embedding_cosine(record, bl, vecs, key):
+    """Add key: {5 aspects} cos(e(M_a), e(R_a)) to every reference of bl (in memory).
+    vecs: {text: L2-normalised vector} covering aspect_texts(record)."""
     entries = list(iter_r_entries(record))
     m_aspects = record.get("m_aspects") or {}
     sims = {r_id: dict.fromkeys(ASPECTS) for r_id, _ in entries}
@@ -208,14 +200,22 @@ def embedding_cosine(paper_json, bl_json, model, key):
         m_text = _clean(m_aspects.get(a))
         if m_text is None:
             continue
-        r_texts = {r_id: _clean((e.get("aspect") or {}).get(a)) for r_id, e in entries}
-        vecs = model.encode([m_text] + [t for t in r_texts.values() if t])
         m_vec = vecs[m_text]
-        for r_id, t in r_texts.items():
+        for r_id, e in entries:
+            t = _clean((e.get("aspect") or {}).get(a))
             if t is not None:
                 sims[r_id][a] = round(float(m_vec @ vecs[t]), ROUND)
 
     for r_id, sim in sims.items():
         bl.setdefault(r_id, {})[key] = sim
-    save_json(bl, bl_json)
-    return len(sims)
+    return bl
+
+
+def specter2(record, bl, vecs):
+    """Add "specter2" {5 aspects} to every reference of bl; vecs from Specter2Model.encode."""
+    return embedding_cosine(record, bl, vecs, SPECTER2_KEY)
+
+
+def scincl(record, bl, vecs):
+    """Add "scincl" {5 aspects} to every reference of bl; vecs from SciNCLModel.encode."""
+    return embedding_cosine(record, bl, vecs, SCINCL_KEY)

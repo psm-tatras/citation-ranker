@@ -93,7 +93,45 @@ class EmbeddingModel:
         return embeddings
 
 
-class Specter2Model:
+class ClsEncoder:
+    """Shared CLS-pooling encoder for the scientific-paper baselines (SPECTER2, SciNCL).
+
+    encode() sorts texts by length (less padding), runs batches of batch_size,
+    uses fp16 on CUDA, and returns L2-normalised CLS vectors (float32, cpu).
+    Subclasses set self.tokenizer / self.model and call self._finish_load().
+    """
+
+    MAX_LENGTH = 512
+
+    def _setup(self, local_dir, env_var, default_subdir, device, batch_size):
+        self.local_dir = local_dir or os.environ.get(
+            env_var,
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "model", "embedding", default_subdir))
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.batch_size = batch_size
+
+    def _finish_load(self):
+        if self.device.startswith("cuda"):
+            self.model.half()
+        self.model.to(self.device).eval()
+
+    def encode(self, texts):
+        """{text: L2-normalised CLS embedding (torch.Tensor, float32, cpu)} for unique texts."""
+        texts = sorted(set(texts), key=len)
+        out = {}
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start:start + self.batch_size]
+            enc = self.tokenizer(batch, padding=True, truncation=True, max_length=self.MAX_LENGTH,
+                                 return_token_type_ids=False, return_tensors="pt").to(self.device)
+            with torch.inference_mode():
+                cls = self.model(**enc).last_hidden_state[:, 0, :]
+            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
+            out.update(zip(batch, cls))
+        return out
+
+
+class Specter2Model(ClsEncoder):
     """SPECTER2 encoder: allenai/specter2_base + proximity adapter allenai/specter2
     (adapters library), CLS pooling, L2-normalised vectors.
 
@@ -105,17 +143,11 @@ class Specter2Model:
     BASE_MODEL = "allenai/specter2_base"
     ADAPTER = "allenai/specter2"
     ADAPTER_NAME = "specter2"
-    MAX_LENGTH = 512
 
-    def __init__(self, local_dir=None, device=None, batch_size=32):
+    def __init__(self, local_dir=None, device=None, batch_size=128):
         from adapters import AutoAdapterModel  # only needed for SPECTER2
 
-        self.local_dir = local_dir or os.environ.get(
-            "SPECTER2_LOCAL_DIR",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "model", "embedding", "specter2"))
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.batch_size = batch_size
+        self._setup(local_dir, "SPECTER2_LOCAL_DIR", "specter2", device, batch_size)
         adapter_dir = os.path.join(self.local_dir, "adapter")
 
         if os.path.isfile(os.path.join(self.local_dir, "config.json")) and os.path.isdir(adapter_dir):
@@ -133,25 +165,10 @@ class Specter2Model:
         # save_pretrained() also stores the adapter, so a local reload "overwrites" it
         # and set_active is dropped -- activate explicitly.
         self.model.set_active_adapters(self.ADAPTER_NAME)
-        self.model.to(self.device).eval()
-
-    def encode(self, texts):
-        """{text: L2-normalised CLS embedding (torch.Tensor, cpu)} for unique texts."""
-        texts = list(dict.fromkeys(texts))
-        out = {}
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start:start + self.batch_size]
-            enc = self.tokenizer(batch, padding=True, truncation=True,
-                                 max_length=self.MAX_LENGTH, return_token_type_ids=False,
-                                 return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                cls = self.model(**enc).last_hidden_state[:, 0, :]
-            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
-            out.update(zip(batch, cls))
-        return out
+        self._finish_load()
 
 
-class SciNCLModel:
+class SciNCLModel(ClsEncoder):
     """SciNCL encoder: malteos/scincl (plain BERT, no adapter), CLS pooling,
     L2-normalised vectors.
 
@@ -161,15 +178,9 @@ class SciNCLModel:
     """
 
     MODEL = "malteos/scincl"
-    MAX_LENGTH = 512
 
-    def __init__(self, local_dir=None, device=None, batch_size=32):
-        self.local_dir = local_dir or os.environ.get(
-            "SCINCL_LOCAL_DIR",
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "model", "embedding", "scincl"))
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.batch_size = batch_size
+    def __init__(self, local_dir=None, device=None, batch_size=128):
+        self._setup(local_dir, "SCINCL_LOCAL_DIR", "scincl", device, batch_size)
 
         if os.path.isfile(os.path.join(self.local_dir, "config.json")):
             self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True)
@@ -180,21 +191,7 @@ class SciNCLModel:
             os.makedirs(self.local_dir, exist_ok=True)
             self.tokenizer.save_pretrained(self.local_dir)
             self.model.save_pretrained(self.local_dir)
-        self.model.to(self.device).eval()
-
-    def encode(self, texts):
-        """{text: L2-normalised CLS embedding (torch.Tensor, cpu)} for unique texts."""
-        texts = list(dict.fromkeys(texts))
-        out = {}
-        for start in range(0, len(texts), self.batch_size):
-            batch = texts[start:start + self.batch_size]
-            enc = self.tokenizer(batch, padding=True, truncation=True,
-                                 max_length=self.MAX_LENGTH, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                cls = self.model(**enc).last_hidden_state[:, 0, :]
-            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
-            out.update(zip(batch, cls))
-        return out
+        self._finish_load()
 
 
 def reference_relevance_computation(base_text, ref_dict, embedding_model):
