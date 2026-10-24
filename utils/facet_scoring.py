@@ -12,10 +12,17 @@ Per main paper M and reference R (contexts k of R with R_MATCH == "yes"):
     alpha_R = ALPHA_BY_FUNCTION[F of the strongest context]  (weak labels -> flatter mask)
     q_R     = alpha_R * p_R + (1 - alpha_R) / |A|             (soft mask)
     idf_a   = log((N + 1) / (n_a + 1)) + 1                    (per M, over contexts)
-    V_R,a   = q_R,a * (idf_a / mean(idf)) * P_R,a             (IDF outside normalisation)
+    W_R,a   = q_R,a * (idf_a / mean(idf))                     (context weight, W_mr)
+    F_R,a   = P_R,a + BETA * W_R,a                            (Final Relevance Vector F_mr, additive:
+                                                               context boosts the cited aspects and
+                                                               never lowers the others; BETA = 0 -> P)
     s_R     = max_k w(F_k)                                    (relation strength)
     c_R     = log(1 + n_R) / log(1 + max_R' n_R')             (citation count, n_R = valid contexts of R, per M)
-    score_R = LAMBDA * s_R + GAMMA * c_R + (1 - LAMBDA - GAMMA) * sum_a V_R,a   (additive)
+    score_R = LAMBDA * s_R + GAMMA * c_R + (1 - LAMBDA - GAMMA) * mean_a F_R,a
+
+BETA = 0.25 chosen on DeepSeek per-aspect grades over 4,927 papers
+(evaluation_main.py): pooled pairwise accuracy (excl. LIMITATION) 0.771 vs 0.771
+for P alone and 0.694 for the earlier multiplicative F = W * P.
 
 Writes `facet_score` into every R entry (after `facet_relevance`) and
 `facet_ranking` + `facet_scoring` (constants, idf) at the top level of the same JSON.
@@ -33,8 +40,8 @@ Citation FUNCTION (Layer 3) and its weight w(F):
 
 Output per R entry:
     aspect_similarity  (from embedding.py)  M~R similarity per aspect, content only, no citation context
-    facet_score        (this script)        facet_similarity vector V_R (similarity weighted by the
-                                            citation context), score, strength, mask, percentile
+    facet_score        (this script)        facet_similarity = F_mr, percentile = V_mr (P),
+                                            context = W_mr, mask = soft mask q; score, strength, count
 
 Usage:
     python facet_scoring.py --input data/facet_predictions/2302.08982.json --output_dir data/facet_scores
@@ -93,7 +100,8 @@ ALPHA_BY_FUNCTION = {           # soft-mask mixing per FUNCTION of R's strongest
     "BACKGROUND": 0.4,
 }
 ALPHA_DEFAULT = 0.4             # R with no valid context
-LAMBDA = 0.4                    # score = LAMBDA * strength + GAMMA * count + (1 - LAMBDA - GAMMA) * sum(facet_similarity)
+BETA = 0.25                     # F_mr = percentile + BETA * context (W_mr); 0 -> content similarity only
+LAMBDA = 0.4                    # score = LAMBDA * strength + GAMMA * count + (1 - LAMBDA - GAMMA) * mean(facet_similarity)
 GAMMA = 0.2                     # weight of the log-normalised context count of R
 MISSING_ASPECT_VALUE = 0.5      # P_R,a when the similarity is missing (neutral = median)
 SINGLE_REF_PERCENTILE = 0.5     # P_R,a when only one reference has that similarity
@@ -209,9 +217,11 @@ class FacetScorer:
             strength = strongest[0] if strongest else 0.0
             alpha = ALPHA_BY_FUNCTION.get(strongest[2], ALPHA_DEFAULT) if strongest else ALPHA_DEFAULT
             q = {a: alpha * p[a] + (1 - alpha) / len(ASPECTS) for a in ASPECTS}
-            V = {a: q[a] * idf_w[a] * P[id(e)][a] for a in ASPECTS}
+            W = {a: q[a] * idf_w[a] for a in ASPECTS}                      # W_mr
+            F = {a: P[id(e)][a] + BETA * W[a] for a in ASPECTS}             # F_mr (additive)
             count = math.log1p(len(ctx)) / math.log1p(max_n) if max_n > 0 else 0.0
-            score = LAMBDA * strength + GAMMA * count + (1 - LAMBDA - GAMMA) * sum(V.values())
+            score = (LAMBDA * strength + GAMMA * count
+                     + (1 - LAMBDA - GAMMA) * sum(F.values()) / len(ASPECTS))
 
             self.insert_after(e, "facet_relevance", "facet_score", {
                 "score": round(score, ROUND),
@@ -219,7 +229,8 @@ class FacetScorer:
                 "count": round(count, ROUND),
                 "alpha": alpha,
                 "n_contexts_used": len(ctx),
-                "facet_similarity": {a: round(V[a], ROUND) for a in ASPECTS},
+                "facet_similarity": {a: round(F[a], ROUND) for a in ASPECTS},
+                "context": {a: round(W[a], ROUND) for a in ASPECTS},
                 "mask": {a: round(q[a], ROUND) for a in ASPECTS},
                 "percentile": {a: round(P[id(e)][a], ROUND) for a in ASPECTS},
             })
@@ -233,6 +244,7 @@ class FacetScorer:
             "comparison_weights": COMPARISON_WEIGHTS,
             "alpha_by_function": ALPHA_BY_FUNCTION,
             "alpha_default": ALPHA_DEFAULT,
+            "beta": BETA,
             "lambda": LAMBDA,
             "gamma": GAMMA,
             "max_contexts": max_n,
