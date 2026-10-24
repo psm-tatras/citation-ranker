@@ -14,7 +14,8 @@ Execution (per chunk of --chunk-size main papers):
 
 Functions:
     initialize      FACET record -> (bl dict, <output_dir>/<m_id>_bl.json path) holding, per
-                    reference, the FACET facet_similarity and percentile vectors
+                    reference, the FACET facet_similarity, percentile (layer 1) and
+                    context (layer 3) vectors
     load_record     (path, record or exception) -- safe JSON read for the prefetch thread
     run_chunk       initialize() + every baseline for a chunk of main papers; writes _bl.json files
     main            CLI: a FACET JSON file or a directory of them; loads models once
@@ -22,8 +23,9 @@ Functions:
 Output (<m_id>_bl.json):
     {
       "<r_id>": {
-        "facet_similarity": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
-        "percentile":       {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
+        "facet_similarity": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},   F_mr = W_mr (.) V_mr
+        "percentile":       {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},   layer 1 score V_mr
+        "context":          {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},   layer 3 score W_mr = mask * idf_weight
         "bm25":             {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "scincl":           {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
@@ -42,22 +44,29 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from utils.baseline_methods import (aspect_texts, bm25, iter_r_entries, load_json, save_json,
-                                    scincl, specter2)
+from utils.baseline_methods import (ASPECTS, ROUND, aspect_texts, bm25, iter_r_entries, load_json,
+                                    save_json, scincl, specter2)
 
 logger = logging.getLogger(__name__)
 
 
 def initialize(record, output_dir, paper_json=None):
-    """(bl, out_path): bl = {r_id: {facet_similarity, percentile}} from a FACET record;
-    out_path = <output_dir>/<m_id>_bl.json (written by run_chunk after all baselines)."""
+    """(bl, out_path): bl = {r_id: {facet_similarity, percentile, context}} from a FACET record;
+    out_path = <output_dir>/<m_id>_bl.json (written by run_chunk after all baselines).
+
+    context[a] = mask[a] * idf_weight[a]  (W_mr; mask per R from facet_score,
+    idf_weight per M from facet_scoring). Aspects missing either value are left out."""
     m_id = record.get("m_id") or Path(paper_json).stem
+    idf_weight = (record.get("facet_scoring") or {}).get("idf_weight") or {}
     bl = {}
     for r_id, entry in iter_r_entries(record):
         fs = entry.get("facet_score") or {}
+        mask = fs.get("mask") or {}
         bl[r_id] = {
             "facet_similarity": fs.get("facet_similarity", {}),
             "percentile": fs.get("percentile", {}),
+            "context": {a: round(mask[a] * idf_weight[a], ROUND)
+                               for a in ASPECTS if a in mask and a in idf_weight},
         }
     return bl, Path(output_dir) / f"{m_id.replace('/', '_')}_bl.json"
 
