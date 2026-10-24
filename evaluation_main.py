@@ -13,6 +13,8 @@ score and compared with the ground-truth grades:
     kendall_tau_b  rank correlation, ties handled (tau-b)
     ndcg           NDCG over all references, gains H=2, M=1, L=0
 Missing / null scores are ranked last for every method.
+DERIVED_METHODS adds methods computed from the file's scores, e.g. the
+additive FACET variant percentile + beta * context (V_mr + beta * W_mr).
 
 Pooled scores combine the aspects: "pooled" over all aspects and "pooled_excl"
 without POOLED_EXCLUDE (LIMITATION is almost always graded L, so it carries few
@@ -39,6 +41,18 @@ from pathlib import Path
 # Configuration (hard-coded; edit here)
 # ---------------------------------------------------------------------------
 METHODS = ["percentile", "facet_similarity", "context", "bm25", "specter2", "scincl"]
+# Derived methods computed from the file's scores: (name, base, added, beta)
+#   score = base + beta * added   (added missing -> 0; base missing -> missing)
+# Additive FACET variant: F = V_mr + beta * W_mr (percentile + beta * context);
+# beta = 0 reproduces V_mr.
+DERIVED_METHODS = [
+    ("additive_0", "percentile", "context", 0.0),
+    ("additive_0.1", "percentile", "context", 0.1),
+    ("additive_0.25", "percentile", "context", 0.25),
+    ("additive_0.5", "percentile", "context", 0.5),
+    ("additive_1.0", "percentile", "context", 1.0),
+]
+ALL_METHODS = METHODS + [name for name, *_ in DERIVED_METHODS]
 ASPECTS = ["TASK", "LIMITATION", "CONTRIBUTION", "METHOD", "RESULT"]
 GRADES = {"H": 2, "M": 1, "L": 0}
 POOLED_EXCLUDE = ["LIMITATION"]
@@ -103,10 +117,26 @@ def _score(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else MISSING_SCORE
 
 
+def _is_num(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def add_derived_methods(bl, derived=DERIVED_METHODS, aspects=ASPECTS):
+    """Add DERIVED_METHODS scores to every reference of a loaded prediction file (in place)."""
+    for scores in bl.values():
+        for name, base, added, beta in derived:
+            b, w = scores.get(base) or {}, scores.get(added) or {}
+            scores[name] = {
+                a: (b[a] + beta * (w.get(a) if _is_num(w.get(a)) else 0.0)) if _is_num(b.get(a)) else None
+                for a in aspects
+            }
+    return bl
+
+
 # ---------------------------------------------------------------------------
 # One main paper
 # ---------------------------------------------------------------------------
-def evaluate_baseline(gt_path, bl_path, methods=METHODS, aspects=ASPECTS):
+def evaluate_baseline(gt_path, bl_path, methods=ALL_METHODS, aspects=ASPECTS):
     """Evaluate every method's per-aspect ranking for one main paper.
 
     Returns:
@@ -121,6 +151,7 @@ def evaluate_baseline(gt_path, bl_path, methods=METHODS, aspects=ASPECTS):
         gt = json.load(f)
     with open(bl_path, encoding="utf-8") as f:
         bl = json.load(f)
+    add_derived_methods(bl, aspects=aspects)
 
     gt_labels = {p["r_id"]: p.get("labels") or {} for p in gt.get("pairs", [])}
     refs = [r for r in gt_labels if r in bl]
@@ -174,7 +205,7 @@ def _pool(per_aspect, aspects):
 # ---------------------------------------------------------------------------
 # Many main papers
 # ---------------------------------------------------------------------------
-def evaluate_baselines(gt_dir, bl_dir, methods=METHODS, aspects=ASPECTS, progress_every=500):
+def evaluate_baselines(gt_dir, bl_dir, methods=ALL_METHODS, aspects=ASPECTS, progress_every=500):
     """Evaluate all <m_id>_gt.json in gt_dir against <m_id>_bl.json in bl_dir.
 
     Returns:
