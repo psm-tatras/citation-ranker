@@ -20,9 +20,10 @@ Per main paper M and reference R (contexts k of R with R_MATCH == "yes"):
     c_R     = log(1 + n_R) / log(1 + max_R' n_R')             (citation count, n_R = valid contexts of R, per M)
     score_R = LAMBDA * s_R + GAMMA * c_R + (1 - LAMBDA - GAMMA) * mean_a F_R,a
 
-BETA = 0.25 chosen on DeepSeek per-aspect grades over 4,927 papers
-(evaluation_main.py): pooled pairwise accuracy (excl. LIMITATION) 0.771 vs 0.771
-for P alone and 0.694 for the earlier multiplicative F = W * P.
+BETA = 0.1 chosen on DeepSeek per-aspect grades over 9,886 papers
+(evaluation_main.py): pooled pairwise accuracy (excl. LIMITATION) 0.772, equal to
+P alone (0.772), vs 0.693 for the earlier multiplicative F = W * P and
+0.694-0.702 for BM25 / SPECTER2 / SciNCL.
 
 Writes `facet_score` into every R entry (after `facet_relevance`) and
 `facet_ranking` + `facet_scoring` (constants, idf) at the top level of the same JSON.
@@ -100,7 +101,7 @@ ALPHA_BY_FUNCTION = {           # soft-mask mixing per FUNCTION of R's strongest
     "BACKGROUND": 0.4,
 }
 ALPHA_DEFAULT = 0.4             # R with no valid context
-BETA = 0.25                     # F_mr = percentile + BETA * context (W_mr); 0 -> content similarity only
+BETA = 0.1                      # F_mr = percentile + BETA * context (W_mr); 0 -> content similarity only
 LAMBDA = 0.4                    # score = LAMBDA * strength + GAMMA * count + (1 - LAMBDA - GAMMA) * mean(facet_similarity)
 GAMMA = 0.2                     # weight of the log-normalised context count of R
 MISSING_ASPECT_VALUE = 0.5      # P_R,a when the similarity is missing (neutral = median)
