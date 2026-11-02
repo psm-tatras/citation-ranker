@@ -11,8 +11,9 @@ models are loaded only when some paper needs them.
 
 Execution (per chunk of --chunk-size main papers):
     - the next chunk's JSONs are read in an I/O thread while the current chunk is computed
-    - per embedding baseline, the unique aspect texts of the chunk's papers missing it are
-      encoded in ONE encode() call; the models run in parallel GPU threads
+    - per embedding model, the unique texts of the chunk's papers missing any baseline of that
+      model (e.g. specter2 + specter2_abstract) are encoded in ONE encode() call; the models
+      run in parallel GPU threads
       (length-sorted batches of --batch-size, fp16 on CUDA)
     - BM25 (CPU) runs in a worker thread while the GPU encodes
     - each paper's record is read once and its _bl.json is written once
@@ -36,7 +37,8 @@ Output (<m_id>_bl.json):
         "bm25":             {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "scincl":           {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
-        "scibert":          {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+        "scibert":          {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
+        "specter2_abstract": {TASK, ..., RESULT}   same whole-abstract SPECTER2 cosine in every aspect
       },
       ...
     }
@@ -53,15 +55,23 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from utils.baseline_methods import (ASPECTS, ROUND, aspect_texts, bm25, embedding_cosine,
-                                    iter_r_entries, load_json, save_json)
+from functools import partial
+
+from utils.baseline_methods import (ASPECTS, ROUND, abstract_texts, aspect_texts, bm25, embedding_cosine,
+                                    iter_r_entries, load_json, save_json, specter2_abstract)
 
 logger = logging.getLogger(__name__)
 
 # Baselines to have in every _bl.json; missing ones are computed. Key = _bl.json key.
-BASELINES = ["bm25", "specter2", "scincl", "scibert"]
-# Embedding baselines: key -> encoder class name in utils.embedding_utils
-EMBEDDING_MODELS = {"specter2": "Specter2Model", "scincl": "SciNCLModel", "scibert": "SciBERTModel"}
+BASELINES = ["bm25", "specter2", "scincl", "scibert", "specter2_abstract"]
+# Embedding baselines: key -> (encoder class in utils.embedding_utils, texts(record), score(record, bl, vecs))
+EMBEDDING_BASELINES = {
+    "specter2": ("Specter2Model", aspect_texts, partial(embedding_cosine, key="specter2")),
+    "scincl": ("SciNCLModel", aspect_texts, partial(embedding_cosine, key="scincl")),
+    "scibert": ("SciBERTModel", aspect_texts, partial(embedding_cosine, key="scibert")),
+    "specter2_abstract": ("Specter2Model", abstract_texts, specter2_abstract),
+}
+EMBEDDING_MODELS = sorted({model for model, _, _ in EMBEDDING_BASELINES.values()})
 
 
 def initialize(record, output_dir, paper_json=None):
@@ -114,12 +124,12 @@ class ModelCache:
         self.batch_size = batch_size
         self.models = {}
 
-    def get(self, key):
-        if key not in self.models:
+    def get(self, name):
+        if name not in self.models:
             from utils import embedding_utils
-            logger.info("loading %s", EMBEDDING_MODELS[key])
-            self.models[key] = getattr(embedding_utils, EMBEDDING_MODELS[key])(batch_size=self.batch_size)
-        return self.models[key]
+            logger.info("loading %s", name)
+            self.models[name] = getattr(embedding_utils, name)(batch_size=self.batch_size)
+        return self.models[name]
 
 
 def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
@@ -145,12 +155,15 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
     if not papers:
         return [], failed, skipped
 
-    # GPU: per embedding baseline, one encode() over the chunk's papers missing it
+    # GPU: per embedding model, one encode() over the texts of every baseline of that model
     futures = {}
-    for key in EMBEDDING_MODELS:
-        texts = set().union(*(aspect_texts(rec) for _, rec, _, _, todo in papers if key in todo))
+    for name in EMBEDDING_MODELS:
+        texts = set()
+        for key, (model, texts_fn, _) in EMBEDDING_BASELINES.items():
+            if model == name:
+                texts.update(*(texts_fn(rec) for _, rec, _, _, todo in papers if key in todo))
         if texts:
-            futures[key] = gpu_pool.submit(models.get(key).encode, texts)
+            futures[name] = gpu_pool.submit(models.get(name).encode, texts)
 
     # CPU: BM25 while the GPU encodes
     def bm25_all():
@@ -174,8 +187,9 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
             continue
         try:
             for key in todo:
-                if key in EMBEDDING_MODELS:
-                    embedding_cosine(rec, bl, vecs[key], key)
+                if key in EMBEDDING_BASELINES:
+                    model, _, score_fn = EMBEDDING_BASELINES[key]
+                    score_fn(rec, bl, vecs[model])
         except Exception:
             failed += 1
             logger.error("%s: %s", path.name, traceback.format_exc())

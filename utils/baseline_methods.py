@@ -44,6 +44,13 @@ SciBERT cosine similarity, per aspect a:
     SciBERT(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)                (raw cosine, [-1, 1])
     SciBERT is null when M_a or R_a is empty.
 
+SPECTER2 whole-abstract cosine similarity (paper-level, not aspect-specific):
+
+    x_P                 = title_P + " [SEP] " + abstract_P     (SPECTER2 input format; abstract only if no title)
+    SPECTER2_abs(M, R)  = cos(e(x_M), e(x_R))                 (e as for SPECTER2, raw cosine, [-1, 1])
+    The same value is stored for all 5 aspects, so evaluation ranks one paper-level score
+    against each aspect's ground truth. Null when M or R has no abstract.
+
 Output per reference in <m_id>_bl.json:
     "bm25":     {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (BM25(T_M,T_R), BM25(L_M,L_R), BM25(C_M,C_R), BM25(M_M,M_R), BM25(R_M,R_R))
@@ -53,6 +60,8 @@ Output per reference in <m_id>_bl.json:
                 = (SciNCL(T_M,T_R), ..., SciNCL(R_M,R_R))
     "scibert":  {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (SciBERT(T_M,T_R), ..., SciBERT(R_M,R_R))
+    "specter2_abstract": {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+                = SPECTER2_abs(M, R) in every aspect
 
 Functions:
     iter_r_entries   (r_id, entry) for every reference of a FACET record
@@ -66,6 +75,9 @@ Functions:
     specter2         embedding_cosine with key "specter2" (vectors: utils.embedding_utils.Specter2Model)
     scincl           embedding_cosine with key "scincl"   (vectors: utils.embedding_utils.SciNCLModel)
     scibert          embedding_cosine with key "scibert"  (vectors: utils.embedding_utils.SciBERTModel)
+    paper_text       title [SEP] abstract of a paper, or None without abstract
+    abstract_texts   unique paper_text of M and its references (input to encode())
+    specter2_abstract adds "specter2_abstract": whole-abstract cosine in every aspect (Specter2Model vectors)
 """
 
 import json
@@ -86,6 +98,8 @@ BM25_KEY = "bm25"
 SPECTER2_KEY = "specter2"
 SCINCL_KEY = "scincl"
 SCIBERT_KEY = "scibert"
+SPECTER2_ABSTRACT_KEY = "specter2_abstract"
+SEP = " [SEP] "
 ROUND = 4
 
 STOPWORDS = frozenset("""
@@ -235,3 +249,35 @@ def scincl(record, bl, vecs):
 def scibert(record, bl, vecs):
     """Add "scibert" {5 aspects} to every reference of bl; vecs from SciBERTModel.encode."""
     return embedding_cosine(record, bl, vecs, SCIBERT_KEY)
+
+
+# ---------------------------------------------------------------------------
+# Baseline: SPECTER2 whole-abstract cosine similarity (paper-level)
+# ---------------------------------------------------------------------------
+def paper_text(title, abstract):
+    """title [SEP] abstract (SPECTER2 input format); abstract alone without title; None without abstract."""
+    abstract, title = _clean(abstract), _clean(title)
+    if abstract is None:
+        return None
+    return title + SEP + abstract if title else abstract
+
+
+def abstract_texts(record):
+    """Set of unique paper_text of M and all its references."""
+    texts = {paper_text(record.get("m_title"), record.get("m_abstract"))}
+    texts.update(paper_text(e.get("title"), e.get("abstract")) for _, e in iter_r_entries(record))
+    texts.discard(None)
+    return texts
+
+
+def specter2_abstract(record, bl, vecs):
+    """Add "specter2_abstract" {5 aspects} = cos(e(x_M), e(x_R)) to every reference of bl;
+    vecs from Specter2Model.encode over abstract_texts(record)."""
+    m_text = paper_text(record.get("m_title"), record.get("m_abstract"))
+    for r_id, e in iter_r_entries(record):
+        r_text = paper_text(e.get("title"), e.get("abstract"))
+        sim = None
+        if m_text is not None and r_text is not None:
+            sim = round(float(vecs[m_text] @ vecs[r_text]), ROUND)
+        bl.setdefault(r_id, {})[SPECTER2_ABSTRACT_KEY] = dict.fromkeys(ASPECTS, sim)
+    return bl

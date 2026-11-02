@@ -40,7 +40,8 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Configuration (hard-coded; edit here)
 # ---------------------------------------------------------------------------
-METHODS = ["percentile", "facet_similarity", "context", "bm25", "specter2", "scincl"]
+METHODS = ["percentile", "facet_similarity", "context", "bm25", "specter2", "scincl", "scibert",
+           "specter2_abstract"]
 # Derived methods computed from the file's scores: (name, base, added, beta)
 #   score = base + beta * added   (added missing -> 0; base missing -> missing)
 # Additive FACET variant: F = V_mr + beta * W_mr (percentile + beta * context);
