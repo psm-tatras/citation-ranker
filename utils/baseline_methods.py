@@ -37,6 +37,13 @@ SciNCL cosine similarity, per aspect a:
     SciNCL(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)                 (raw cosine, [-1, 1])
     SciNCL is null when M_a or R_a is empty.
 
+SciBERT cosine similarity, per aspect a:
+
+    e(x)             = L2-normalised mean-pooled (attention-masked) last hidden state of text x
+                       from SciBERT (allenai/scibert_scivocab_uncased, max 512 tokens)
+    SciBERT(M_a,R_a) = cos(e(M_a), e(R_a)) = e(M_a) . e(R_a)                (raw cosine, [-1, 1])
+    SciBERT is null when M_a or R_a is empty.
+
 Output per reference in <m_id>_bl.json:
     "bm25":     {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (BM25(T_M,T_R), BM25(L_M,L_R), BM25(C_M,C_R), BM25(M_M,M_R), BM25(R_M,R_R))
@@ -44,6 +51,8 @@ Output per reference in <m_id>_bl.json:
                 = (SPECTER2(T_M,T_R), ..., SPECTER2(R_M,R_R))
     "scincl":   {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
                 = (SciNCL(T_M,T_R), ..., SciNCL(R_M,R_R))
+    "scibert":  {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT}
+                = (SciBERT(T_M,T_R), ..., SciBERT(R_M,R_R))
 
 Functions:
     iter_r_entries   (r_id, entry) for every reference of a FACET record
@@ -56,6 +65,7 @@ Functions:
     embedding_cosine adds key: per-aspect cosine to every reference of bl, from precomputed vectors
     specter2         embedding_cosine with key "specter2" (vectors: utils.embedding_utils.Specter2Model)
     scincl           embedding_cosine with key "scincl"   (vectors: utils.embedding_utils.SciNCLModel)
+    scibert          embedding_cosine with key "scibert"  (vectors: utils.embedding_utils.SciBERTModel)
 """
 
 import json
@@ -75,6 +85,7 @@ BM25_B = 0.75
 BM25_KEY = "bm25"
 SPECTER2_KEY = "specter2"
 SCINCL_KEY = "scincl"
+SCIBERT_KEY = "scibert"
 ROUND = 4
 
 STOPWORDS = frozenset("""
@@ -171,7 +182,7 @@ def bm25(record, bl):
 
 
 # ---------------------------------------------------------------------------
-# Baselines: embedding cosine similarity per aspect (SPECTER2, SciNCL)
+# Baselines: embedding cosine similarity per aspect (SPECTER2, SciNCL, SciBERT)
 # ---------------------------------------------------------------------------
 def _clean(text):
     """Whitespace-normalised text, or None if empty/non-string."""
@@ -219,3 +230,8 @@ def specter2(record, bl, vecs):
 def scincl(record, bl, vecs):
     """Add "scincl" {5 aspects} to every reference of bl; vecs from SciNCLModel.encode."""
     return embedding_cosine(record, bl, vecs, SCINCL_KEY)
+
+
+def scibert(record, bl, vecs):
+    """Add "scibert" {5 aspects} to every reference of bl; vecs from SciBERTModel.encode."""
+    return embedding_cosine(record, bl, vecs, SCIBERT_KEY)

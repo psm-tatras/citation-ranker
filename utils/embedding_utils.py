@@ -94,14 +94,16 @@ class EmbeddingModel:
 
 
 class ClsEncoder:
-    """Shared CLS-pooling encoder for the scientific-paper baselines (SPECTER2, SciNCL).
+    """Shared encoder for the scientific-paper baselines (SPECTER2, SciNCL, SciBERT).
 
     encode() sorts texts by length (less padding), runs batches of batch_size,
-    uses fp16 on CUDA, and returns L2-normalised CLS vectors (float32, cpu).
+    uses fp16 on CUDA, and returns L2-normalised vectors (float32, cpu), pooled
+    by POOLING: "cls" (CLS token) or "mean" (mask-weighted mean of last hidden state).
     Subclasses set self.tokenizer / self.model and call self._finish_load().
     """
 
     MAX_LENGTH = 512
+    POOLING = "cls"
 
     def _setup(self, local_dir, env_var, default_subdir, device, batch_size):
         self.local_dir = local_dir or os.environ.get(
@@ -125,9 +127,14 @@ class ClsEncoder:
             enc = self.tokenizer(batch, padding=True, truncation=True, max_length=self.MAX_LENGTH,
                                  return_token_type_ids=False, return_tensors="pt").to(self.device)
             with torch.inference_mode():
-                cls = self.model(**enc).last_hidden_state[:, 0, :]
-            cls = torch.nn.functional.normalize(cls.float(), dim=-1).cpu()
-            out.update(zip(batch, cls))
+                hidden = self.model(**enc).last_hidden_state
+            if self.POOLING == "mean":
+                mask = enc["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                vec = (hidden.float() * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+            else:
+                vec = hidden[:, 0, :]
+            vec = torch.nn.functional.normalize(vec.float(), dim=-1).cpu()
+            out.update(zip(batch, vec))
         return out
 
 
@@ -181,6 +188,33 @@ class SciNCLModel(ClsEncoder):
 
     def __init__(self, local_dir=None, device=None, batch_size=128):
         self._setup(local_dir, "SCINCL_LOCAL_DIR", "scincl", device, batch_size)
+
+        if os.path.isfile(os.path.join(self.local_dir, "config.json")):
+            self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True)
+            self.model = AutoModel.from_pretrained(self.local_dir, local_files_only=True)
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.MODEL)
+            self.model = AutoModel.from_pretrained(self.MODEL)
+            os.makedirs(self.local_dir, exist_ok=True)
+            self.tokenizer.save_pretrained(self.local_dir)
+            self.model.save_pretrained(self.local_dir)
+        self._finish_load()
+
+
+class SciBERTModel(ClsEncoder):
+    """SciBERT encoder: allenai/scibert_scivocab_uncased (plain BERT, not trained for
+    sentence embeddings), mean pooling, L2-normalised vectors.
+
+    First run downloads the model from the HF Hub and saves it to local_dir
+    (SCIBERT_LOCAL_DIR, default model/embedding/scibert); later runs load from
+    local_dir only.
+    """
+
+    MODEL = "allenai/scibert_scivocab_uncased"
+    POOLING = "mean"
+
+    def __init__(self, local_dir=None, device=None, batch_size=128):
+        self._setup(local_dir, "SCIBERT_LOCAL_DIR", "scibert", device, batch_size)
 
         if os.path.isfile(os.path.join(self.local_dir, "config.json")):
             self.tokenizer = AutoTokenizer.from_pretrained(self.local_dir, local_files_only=True)
