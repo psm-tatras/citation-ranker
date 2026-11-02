@@ -11,9 +11,9 @@ models are loaded only when some paper needs them.
 
 Execution (per chunk of --chunk-size main papers):
     - the next chunk's JSONs are read in an I/O thread while the current chunk is computed
-    - per embedding model, the unique texts of the chunk's papers missing any baseline of that
-      model (e.g. specter2 + specter2_abstract) are encoded in ONE encode() call; the models
-      run in parallel GPU threads
+    - per (encoder, instruction) group, the unique texts of the chunk's papers missing any
+      baseline of that group (e.g. specter2 + specter2_abstract) are encoded in ONE encode()
+      call; the groups run in parallel GPU threads
       (length-sorted batches of --batch-size, fp16 on CUDA)
     - BM25 (CPU) runs in a worker thread while the GPU encodes
     - each paper's record is read once and its _bl.json is written once
@@ -38,7 +38,9 @@ Output (<m_id>_bl.json):
         "specter2":         {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "scincl":           {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
         "scibert":          {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
-        "specter2_abstract": {TASK, ..., RESULT}   same whole-abstract SPECTER2 cosine in every aspect
+        "qwen3_aspect":     {TASK, LIMITATION, CONTRIBUTION, METHOD, RESULT},
+        "bm25_abstract", "specter2_abstract", "scincl_abstract", "scibert_abstract", "qwen3_abstract":
+                            {TASK, ..., RESULT}   same paper-level score in every aspect
       },
       ...
     }
@@ -57,21 +59,42 @@ from pathlib import Path
 
 from functools import partial
 
-from utils.baseline_methods import (ASPECTS, ROUND, abstract_texts, aspect_texts, bm25, embedding_cosine,
-                                    iter_r_entries, load_json, save_json, specter2_abstract)
+from utils.baseline_methods import (ASPECTS, PLAIN_SEP, ROUND, abstract_cosine, abstract_texts, aspect_texts,
+                                    bm25, bm25_abstract, embedding_cosine, iter_r_entries, load_json,
+                                    save_json)
 
 logger = logging.getLogger(__name__)
 
 # Baselines to have in every _bl.json; missing ones are computed. Key = _bl.json key.
-BASELINES = ["bm25", "specter2", "scincl", "scibert", "specter2_abstract"]
-# Embedding baselines: key -> (encoder class in utils.embedding_utils, texts(record), score(record, bl, vecs))
+# Family 1 (aspect-level: FACET extracted aspects)   -- mirrors FACET V_mr (Qwen3, aspect instructions)
+# Family 2 (paper-level: title + abstract, no FACET extraction)
+BASELINES = ["bm25", "specter2", "scincl", "scibert", "qwen3_aspect",
+             "bm25_abstract", "specter2_abstract", "scincl_abstract", "scibert_abstract", "qwen3_abstract"]
+# CPU baselines: key -> score(record, bl)
+CPU_BASELINES = {"bm25": bm25, "bm25_abstract": bm25_abstract}
+# Embedding baselines: key -> (encoder class in utils.embedding_utils, encode() kwargs,
+#                              texts(record), score(record, bl, vecs))
+# Baselines with the same (encoder, kwargs) share one encode() call per chunk.
+_QWEN_ASPECT = {"instruction": "ASPECT_INSTRUCTION"}
+_QWEN_PAPER = {"instruction": "PAPER_INSTRUCTION"}
 EMBEDDING_BASELINES = {
-    "specter2": ("Specter2Model", aspect_texts, partial(embedding_cosine, key="specter2")),
-    "scincl": ("SciNCLModel", aspect_texts, partial(embedding_cosine, key="scincl")),
-    "scibert": ("SciBERTModel", aspect_texts, partial(embedding_cosine, key="scibert")),
-    "specter2_abstract": ("Specter2Model", abstract_texts, specter2_abstract),
+    "specter2": ("Specter2Model", {}, aspect_texts, partial(embedding_cosine, key="specter2")),
+    "scincl": ("SciNCLModel", {}, aspect_texts, partial(embedding_cosine, key="scincl")),
+    "scibert": ("SciBERTModel", {}, aspect_texts, partial(embedding_cosine, key="scibert")),
+    "qwen3_aspect": ("Qwen3Model", _QWEN_ASPECT, aspect_texts, partial(embedding_cosine, key="qwen3_aspect")),
+    "specter2_abstract": ("Specter2Model", {}, abstract_texts, partial(abstract_cosine, key="specter2_abstract")),
+    "scincl_abstract": ("SciNCLModel", {}, abstract_texts, partial(abstract_cosine, key="scincl_abstract")),
+    "scibert_abstract": ("SciBERTModel", {}, abstract_texts, partial(abstract_cosine, key="scibert_abstract")),
+    "qwen3_abstract": ("Qwen3Model", _QWEN_PAPER, partial(abstract_texts, sep=PLAIN_SEP),
+                       partial(abstract_cosine, key="qwen3_abstract", sep=PLAIN_SEP)),
 }
-EMBEDDING_MODELS = sorted({model for model, _, _ in EMBEDDING_BASELINES.values()})
+EMBEDDING_MODELS = sorted({model for model, *_ in EMBEDDING_BASELINES.values()})
+
+
+def _group(key):
+    """(encoder, kwargs-items) -- baselines of one group share an encode() call."""
+    model, kwargs, *_ = EMBEDDING_BASELINES[key]
+    return model, tuple(sorted(kwargs.items()))
 
 
 def initialize(record, output_dir, paper_json=None):
@@ -155,25 +178,29 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
     if not papers:
         return [], failed, skipped
 
-    # GPU: per embedding model, one encode() over the texts of every baseline of that model
+    # GPU: one encode() per (encoder, kwargs) group over the texts of its baselines missing here
+    texts = {}
+    for key, (_, _, texts_fn, _) in EMBEDDING_BASELINES.items():
+        for _, rec, _, _, todo in papers:
+            if key in todo:
+                texts.setdefault(_group(key), set()).update(texts_fn(rec))
     futures = {}
-    for name in EMBEDDING_MODELS:
-        texts = set()
-        for key, (model, texts_fn, _) in EMBEDDING_BASELINES.items():
-            if model == name:
-                texts.update(*(texts_fn(rec) for _, rec, _, _, todo in papers if key in todo))
-        if texts:
-            futures[name] = gpu_pool.submit(models.get(name).encode, texts)
+    for (model, kw), group_texts in texts.items():
+        if group_texts:
+            encoder = models.get(model)
+            kwargs = {k: getattr(encoder, v) for k, v in kw}   # instruction name -> text
+            futures[(model, kw)] = gpu_pool.submit(encoder.encode, group_texts, **kwargs)
 
-    # CPU: BM25 while the GPU encodes
+    # CPU: BM25 baselines while the GPU encodes
     def bm25_all():
         errors = {}
         for path, rec, bl, _, todo in papers:
-            if "bm25" in todo:
-                try:
-                    bm25(rec, bl)
-                except Exception:
-                    errors[path] = traceback.format_exc()
+            try:
+                for key in todo:
+                    if key in CPU_BASELINES:
+                        CPU_BASELINES[key](rec, bl)
+            except Exception:
+                errors[path] = traceback.format_exc()
         return errors
 
     bm25_errors = cpu_pool.submit(bm25_all).result()
@@ -188,8 +215,8 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
         try:
             for key in todo:
                 if key in EMBEDDING_BASELINES:
-                    model, _, score_fn = EMBEDDING_BASELINES[key]
-                    score_fn(rec, bl, vecs[model])
+                    score_fn = EMBEDDING_BASELINES[key][3]
+                    score_fn(rec, bl, vecs[_group(key)])
         except Exception:
             failed += 1
             logger.error("%s: %s", path.name, traceback.format_exc())
