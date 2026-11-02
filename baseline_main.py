@@ -13,7 +13,8 @@ Execution (per chunk of --chunk-size main papers):
     - the next chunk's JSONs are read in an I/O thread while the current chunk is computed
     - per (encoder, instruction) group, the unique texts of the chunk's papers missing any
       baseline of that group (e.g. specter2 + specter2_abstract) are encoded in ONE encode()
-      call; the groups run in parallel GPU threads
+      call; groups run one after another in one GPU thread, GPU cache freed after each
+    - --methods restricts the run to some baselines; models of other baselines are never loaded
       (length-sorted batches of --batch-size, fp16 on CUDA)
     - BM25 (CPU) runs in a worker thread while the GPU encodes
     - each paper's record is read once and its _bl.json is written once
@@ -49,6 +50,7 @@ Usage:
     python -m baseline_main --input data/facet_scores/0704.0262.json --output_dir data/baselines
     python -m baseline_main --input data/facet_scores --output_dir data/baselines --chunk-size 32 --batch-size 128
     python -m baseline_main --input data/facet_scores --bl_dir data/baselines --output_dir data/baselines_v2
+    python -m baseline_main --input data/facet_scores --output_dir data/baselines --methods qwen3_aspect --qwen-batch-size 8
 """
 
 import argparse
@@ -88,7 +90,6 @@ EMBEDDING_BASELINES = {
     "qwen3_abstract": ("Qwen3Model", _QWEN_PAPER, partial(abstract_texts, sep=PLAIN_SEP),
                        partial(abstract_cosine, key="qwen3_abstract", sep=PLAIN_SEP)),
 }
-EMBEDDING_MODELS = sorted({model for model, *_ in EMBEDDING_BASELINES.values()})
 
 
 def _group(key):
@@ -141,22 +142,34 @@ def load_record(path):
 
 
 class ModelCache:
-    """Embedding models, created on first use (sequentially, in the calling thread)."""
+    """Embedding models, created on first use -- only models of baselines that are both selected
+    (--methods) and missing in some paper are ever loaded. Qwen3Model uses qwen_batch_size."""
 
-    def __init__(self, batch_size):
+    def __init__(self, batch_size, qwen_batch_size):
         self.batch_size = batch_size
+        self.qwen_batch_size = qwen_batch_size
         self.models = {}
 
     def get(self, name):
         if name not in self.models:
             from utils import embedding_utils
-            logger.info("loading %s", name)
-            self.models[name] = getattr(embedding_utils, name)(batch_size=self.batch_size)
+            bs = self.qwen_batch_size if name == "Qwen3Model" else self.batch_size
+            logger.info("loading %s (batch size %d)", name, bs)
+            self.models[name] = getattr(embedding_utils, name)(batch_size=bs)
         return self.models[name]
 
 
-def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
-    """Missing baselines for one chunk of loaded (path, record) pairs.
+def _free_gpu_cache():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool, methods=BASELINES):
+    """Missing baselines (of `methods`) for one chunk of loaded (path, record) pairs.
     Returns (list of written _bl.json paths, number of failed papers, number skipped)."""
     papers, failed, skipped = [], 0, 0
     for path, rec in loaded:
@@ -170,7 +183,7 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
             failed += 1
             logger.error("%s: %s", path.name, traceback.format_exc())
             continue
-        todo = missing_methods(bl)
+        todo = missing_methods(bl, methods)
         if not todo and not is_new and Path(bl_dir) == Path(output_dir):
             skipped += 1
             continue
@@ -184,12 +197,18 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
         for _, rec, _, _, todo in papers:
             if key in todo:
                 texts.setdefault(_group(key), set()).update(texts_fn(rec))
-    futures = {}
-    for (model, kw), group_texts in texts.items():
-        if group_texts:
-            encoder = models.get(model)
-            kwargs = {k: getattr(encoder, v) for k, v in kw}   # instruction name -> text
-            futures[(model, kw)] = gpu_pool.submit(encoder.encode, group_texts, **kwargs)
+    # groups run one after another in ONE GPU thread (one model's activations in memory at a time)
+    def gpu_all():
+        out = {}
+        for (model, kw), group_texts in sorted(texts.items()):
+            if group_texts:
+                encoder = models.get(model)
+                kwargs = {k: getattr(encoder, v) for k, v in kw}   # instruction name -> text
+                out[(model, kw)] = encoder.encode(group_texts, **kwargs)
+                _free_gpu_cache()
+        return out
+
+    f_gpu = gpu_pool.submit(gpu_all)
 
     # CPU: BM25 baselines while the GPU encodes
     def bm25_all():
@@ -204,7 +223,7 @@ def run_chunk(loaded, output_dir, bl_dir, models, cpu_pool, gpu_pool, io_pool):
         return errors
 
     bm25_errors = cpu_pool.submit(bm25_all).result()
-    vecs = {key: fut.result() for key, fut in futures.items()}
+    vecs = f_gpu.result()
 
     written, saves = [], []
     for path, rec, bl, out_path, todo in papers:
@@ -240,7 +259,12 @@ def main():
                         help="Existing <m_id>_bl.json files to extend (default: output_dir)")
     parser.add_argument("--pattern", default="*.json")
     parser.add_argument("--chunk-size", type=int, default=32, help="Main papers per encode() call")
-    parser.add_argument("--batch-size", type=int, default=128, help="Texts per model forward pass")
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Texts per forward pass for the BERT encoders")
+    parser.add_argument("--qwen-batch-size", type=int, default=8,
+                        help="Texts per forward pass for Qwen3-Embedding-4B")
+    parser.add_argument("--methods", nargs="+", default=BASELINES, choices=BASELINES, metavar="METHOD",
+                        help="Baselines to compute when missing (default: all of BASELINES)")
     args = parser.parse_args()
     bl_dir = args.bl_dir or args.output_dir
 
@@ -248,10 +272,11 @@ def main():
     p = Path(args.input)
     files = [p] if p.is_file() else sorted(p.glob(args.pattern))
     chunks = [files[i:i + args.chunk_size] for i in range(0, len(files), args.chunk_size)]
-    models = ModelCache(args.batch_size)
+    models = ModelCache(args.batch_size, args.qwen_batch_size)
+    logger.info("methods: %s", ", ".join(args.methods))
 
     done = failed = skipped = 0
-    with ThreadPoolExecutor(1) as cpu_pool, ThreadPoolExecutor(len(EMBEDDING_MODELS)) as gpu_pool, \
+    with ThreadPoolExecutor(1) as cpu_pool, ThreadPoolExecutor(1) as gpu_pool, \
             ThreadPoolExecutor(4) as io_pool:
         pending = [io_pool.submit(load_record, f) for f in chunks[0]] if chunks else []
         for k in range(len(chunks)):
@@ -259,7 +284,7 @@ def main():
             pending = [io_pool.submit(load_record, f) for f in chunks[k + 1]] if k + 1 < len(chunks) else []
             try:
                 written, n_failed, n_skipped = run_chunk(loaded, args.output_dir, bl_dir, models,
-                                                         cpu_pool, gpu_pool, io_pool)
+                                                         cpu_pool, gpu_pool, io_pool, args.methods)
             except Exception:
                 failed += len(loaded)
                 logger.error("chunk %d failed: %s", k, traceback.format_exc())

@@ -231,18 +231,17 @@ class SciBERTModel(ClsEncoder):
 class Qwen3Model:
     """Qwen3-Embedding (same model and local cache as prediction.qwen_embedding, the FACET
     aspect encoder) for the baselines: one instruction on both sides, max MAX_LENGTH tokens,
-    batches of at most MAX_BATCH. encode(texts, instruction) -> {text: L2-normalised vector}."""
+    batches of batch_size (length-sorted). encode(texts, instruction) -> {text: L2-normalised vector}."""
 
     PAPER_INSTRUCTION = ("Represent a scientific paper (title and abstract), "
                          "for comparison with other papers")
     ASPECT_INSTRUCTION = ("Represent a statement from a scientific paper, "
                           "for comparison with statements from other papers")
     MAX_LENGTH = 512
-    MAX_BATCH = 32
 
-    def __init__(self, batch_size=32, **kwargs):
+    def __init__(self, batch_size=8, **kwargs):
         from prediction.qwen_embedding import AspectSimilarity  # needs sentence_transformers
-        self.batch_size = min(batch_size, self.MAX_BATCH)
+        self.batch_size = batch_size
         self.model = AspectSimilarity(batch_size=self.batch_size,
                                       max_seq_length=self.MAX_LENGTH, **kwargs).model
 
